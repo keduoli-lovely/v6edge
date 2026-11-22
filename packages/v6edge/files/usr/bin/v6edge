@@ -680,6 +680,8 @@ render_service() { # render_service NAME
 	large=$(svc_get "$name" large); large=${large:-0}
 	hsts=$(svc_get "$name" hsts); hsts=${hsts:-1}
 	deny_post=$(svc_get "$name" deny_post)
+	proxy_host=$(svc_get "$name" proxy_host)
+	if [ "$proxy_host" = "target" ]; then proxy_host=$(printf "%s" "$backend" | sed 's#^[a-z]*://##; s#/.*$##'); fi
 	paths=$(cert_paths "$fqdn"); crt=${paths%% *}; key=${paths#* }
 	out="/etc/nginx/conf.d/v6edge-$name.conf"
 
@@ -720,7 +722,11 @@ render_service() { # render_service NAME
 				echo "        if (\$request_method = POST) { return 403; }"
 				echo "        proxy_pass $backend;"
 				echo "        proxy_http_version 1.1;"
-				echo "        proxy_set_header Host              \$http_host;"
+				if [ -n "$proxy_host" ]; then
+			echo "        proxy_set_header Host              $proxy_host;";
+		else
+			echo "        proxy_set_header Host              \$http_host;";
+		fi
 				echo "        proxy_set_header X-Real-IP         \$remote_addr;"
 				echo "        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;"
 				echo "        proxy_set_header X-Forwarded-Proto https;"
@@ -730,7 +736,11 @@ render_service() { # render_service NAME
 		echo "    location / {"
 		echo "        proxy_pass $backend;"
 		echo "        proxy_http_version 1.1;"
-		echo "        proxy_set_header Host              \$http_host;"
+		if [ -n "$proxy_host" ]; then
+			echo "        proxy_set_header Host              $proxy_host;";
+		else
+			echo "        proxy_set_header Host              \$http_host;";
+		fi
 		echo "        proxy_set_header X-Real-IP         \$remote_addr;"
 		echo "        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;"
 		echo "        proxy_set_header X-Forwarded-Proto https;"
@@ -1130,6 +1140,7 @@ cmd_add() {
 	uci set "v6edge.$sec.domain=$domain"
 	[ -n "$svc_zone" ] && uci set "v6edge.$sec.zone=$svc_zone"
 	uci set "v6edge.$sec.target=$target"
+	[ -n "$_phost" ] && uci set "v6edge.$sec.proxy_host=$_phost"
 	uci set "v6edge.$sec.port=$port"
 	uci set "v6edge.$sec.scheme=$scheme"
 	uci set "v6edge.$sec.lan_only=$lan_only"
@@ -1260,7 +1271,7 @@ cmd_zone() {
 	add)
 		name=${1:-}; [ -n "$name" ] || die "用法: v6edge zone add <域名> --provider X [--token T | --ali-key AK --ali-secret SK]"
 		shift 2>/dev/null || true
-		prov=""; _tok=""; _ak=""; _sk=""
+		prov=""; _tok=""; _ak=""; _sk=""; _phost=""
 		while [ $# -gt 0 ]; do
 			case "$1" in
 			--provider) prov=$2; shift 2 ;;
@@ -1268,6 +1279,7 @@ cmd_zone() {
 			--ali-key) _ak=$2; shift 2 ;;
 			--ali-secret) _sk=$2; shift 2 ;;
 			--cred) _cred=$2; shift 2 ;;
+			--proxy-host) _phost=$2; shift 2 ;;
 			*) shift ;;
 			esac
 		done
@@ -1418,6 +1430,7 @@ cmd_set() {
 		--large) uci set "v6edge.$sec.large=$2"; shift 2 ;;
 		--ws) uci set "v6edge.$sec.ws=$2"; shift 2 ;;
 		--deny-post) uci set "v6edge.$sec.deny_post=$2"; shift 2 ;;
+		--proxy-host) uci set "v6edge.$sec.proxy_host=$2"; shift 2 ;;
 		--enabled) uci set "v6edge.$sec.enabled=$2"; shift 2 ;;
 		*) die "未知参数 $1" ;;
 		esac
@@ -1672,6 +1685,11 @@ cmd_doctor() {
 		if [ -n "$ip" ]; then
 			got=$(curl -s -m 15 "$DOH?name=$f&type=AAAA" -H 'accept: application/dns-json' 2>/dev/null |
 				grep -o '"data":"[0-9a-f:]*"' | head -1 | cut -d'"' -f4)
+			# doh.pub 等解析器可能缓存了删除期间的 NXDOMAIN，换一个 DoH 复核
+			if [ -z "$got" ]; then
+				got=$(curl -s -m 15 "https://dns.alidns.com/resolve?name=$f&type=AAAA" -H 'accept: application/dns-json' 2>/dev/null |
+					grep -o '"data":"[0-9a-f:]*"' | head -1 | cut -d'"' -f4)
+			fi
 			[ "$got" = "$ip" ] && chk_ok "$s: DNS AAAA 正确" || chk_warn "$s: DNS AAAA=$got，当前=$ip"
 		fi
 	done
