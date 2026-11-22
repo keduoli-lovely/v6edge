@@ -1114,7 +1114,7 @@ cmd_add() {
 	name=${1:-}; target=${2:-}; port=${3:-edge}
 	[ -n "$name" ] && [ -n "$target" ] || die "用法: v6edge add <名字> <内网IP:端口> [公网端口|edge] [选项]"
 	shift 2; [ $# -gt 0 ] && shift
-	lan_only=0; ws=1; large=0; scheme=http; deny_post=""; domain=""; svc_zone=""
+	lan_only=0; ws=1; large=0; scheme=http; deny_post=""; domain=""; svc_zone=""; _phost=""; _porigin=""
 	while [ $# -gt 0 ]; do
 		case "$1" in
 		--lan-only) lan_only=1; shift ;;
