@@ -1,13 +1,13 @@
 {
-	"admin/services/cfedge": {
+	"admin/services/v6edge": {
 		"title": "Cloudflare 边缘",
 		"order": 61,
 		"action": {
 			"type": "view",
-			"path": "cfedge/main"
+			"path": "v6edge/main"
 		},
 		"depends": {
-			"acl": [ "luci-app-cfedge" ]
+			"acl": [ "luci-app-v6edge" ]
 		}
 	}
 }

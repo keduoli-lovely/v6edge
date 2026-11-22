@@ -34,8 +34,8 @@ jobs:
         run: |
           set -e
           cd sdk
-          mkdir -p package/cfedge
-          cp -r "$GITHUB_WORKSPACE/packages/"* package/cfedge/
+          mkdir -p package/v6edge
+          cp -r "$GITHUB_WORKSPACE/packages/"* package/v6edge/
           ./scripts/feeds update -a
           ./scripts/feeds install -a || true
           make defconfig
@@ -44,18 +44,18 @@ jobs:
         run: |
           set -e
           cd sdk
-          make package/cfedge/cfedge/compile V=s -j$(nproc) || \
-            make package/cfedge/compile V=s -j1
-          make package/luci-app-cfedge/compile V=s -j1 || true
+          make package/v6edge/v6edge/compile V=s -j$(nproc) || \
+            make package/v6edge/compile V=s -j1
+          make package/luci-app-v6edge/compile V=s -j1 || true
 
       - name: Collect artifacts
         run: |
           mkdir -p out
-          find sdk/bin -type f \( -name 'cfedge*.ipk' -o -name 'luci-app-cfedge*.ipk' \
-            -o -name 'cfedge*.apk' -o -name 'luci-app-cfedge*.apk' \) -exec cp {} out/ \;
+          find sdk/bin -type f \( -name 'v6edge*.ipk' -o -name 'luci-app-v6edge*.ipk' \
+            -o -name 'v6edge*.apk' -o -name 'luci-app-v6edge*.apk' \) -exec cp {} out/ \;
           ls -l out
 
       - uses: actions/upload-artifact@v4
         with:
-          name: cfedge-${{ matrix.sdk }}
+          name: v6edge-${{ matrix.sdk }}
           path: out/*

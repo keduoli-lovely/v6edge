@@ -1,8 +1,8 @@
 // 生成发行产物：
-//   dist/cfedge-<ver>.run                     自解压安装器（iStoreOS 离线页 / 任意 shell）
-//   dist/cfedge-<ver>-bundle.tar.gz           解压后 sh install.sh
-//   dist/cfedge_<ver>-24_all.ipk              opkg 系（OpenWrt 24.10 / 旧 iStoreOS 24.x）
-//   dist/luci-app-cfedge_<ver>-24_all.ipk     同上，LuCI 部分
+//   dist/v6edge-<ver>.run                     自解压安装器（iStoreOS 离线页 / 任意 shell）
+//   dist/v6edge-<ver>-bundle.tar.gz           解压后 sh install.sh
+//   dist/v6edge_<ver>-24_all.ipk              opkg 系（OpenWrt 24.10 / 旧 iStoreOS 24.x）
+//   dist/luci-app-v6edge_<ver>-24_all.ipk     同上，LuCI 部分
 // 25.x 的 .apk 用 tools/build-apk-on-device.sh 在设备上生成（ADB 格式，需 mkpkg）
 const fs = require('fs');
 const path = require('path');
@@ -16,60 +16,61 @@ const DIST = path.join(ROOT, 'dist');
 const VER = '0.1.0';
 
 const CORE = [
-	['usr/bin/cfedge', path.join(PKG, 'cfedge/files/usr/bin/cfedge'), 0o755],
-	['usr/share/cfedge/defaults/cfedge', path.join(PKG, 'cfedge/files/etc/config/cfedge'), 0o600]
+	['usr/bin/v6edge', path.join(PKG, 'v6edge/files/usr/bin/v6edge'), 0o755],
+	['usr/share/v6edge/defaults/v6edge', path.join(PKG, 'v6edge/files/etc/config/v6edge'), 0o600]
 ];
 const LUCI = [
-	['usr/share/luci/menu.d/luci-app-cfedge.json',
-		path.join(PKG, 'luci-app-cfedge/root/usr/share/luci/menu.d/luci-app-cfedge.json'), 0o644],
-	['usr/share/rpcd/acl.d/luci-app-cfedge.json',
-		path.join(PKG, 'luci-app-cfedge/root/usr/share/rpcd/acl.d/luci-app-cfedge.json'), 0o644],
-	['www/luci-static/resources/view/cfedge/main.js',
-		path.join(PKG, 'luci-app-cfedge/root/www/luci-static/resources/view/cfedge/main.js'), 0o644]
+	['usr/share/luci/menu.d/luci-app-v6edge.json',
+		path.join(PKG, 'luci-app-v6edge/root/usr/share/luci/menu.d/luci-app-v6edge.json'), 0o644],
+	['usr/share/rpcd/acl.d/luci-app-v6edge.json',
+		path.join(PKG, 'luci-app-v6edge/root/usr/share/rpcd/acl.d/luci-app-v6edge.json'), 0o644],
+	['www/luci-static/resources/view/v6edge/main.js',
+		path.join(PKG, 'luci-app-v6edge/root/www/luci-static/resources/view/v6edge/main.js'), 0o644]
 ];
 
 const INSTALL_SH = [
 	'#!/bin/sh',
-	'# cfedge 安装脚本（幂等）',
-	'#   sh install.sh            升级/安装，保留现有 /etc/config/cfedge 与 /etc/cfedge 状态',
+	'# v6edge 安装脚本（幂等）',
+	'#   sh install.sh            升级/安装，保留现有 /etc/config/v6edge 与 /etc/v6edge 状态',
 	'#   sh install.sh --fresh    测试用：把现有配置和状态改名备份，按全新环境安装',
 	'set -e',
 	'cd "$(dirname "$0")"',
 	'TS=$(date +%Y%m%d-%H%M%S)',
 	'',
 	'if [ "${1:-}" = "--fresh" ]; then',
-	'\t[ -f /etc/config/cfedge ] && mv /etc/config/cfedge "/etc/config/cfedge.bak-$TS" && echo "配置已备份为 /etc/config/cfedge.bak-$TS"',
-	'\t[ -d /etc/cfedge ] && mv /etc/cfedge "/etc/cfedge.bak-$TS" && echo "状态目录已备份为 /etc/cfedge.bak-$TS"',
+	'\t[ -f /etc/config/v6edge ] && mv /etc/config/v6edge "/etc/config/v6edge.bak-$TS" && echo "配置已备份为 /etc/config/v6edge.bak-$TS"',
+	'\t[ -d /etc/v6edge ] && mv /etc/v6edge "/etc/v6edge.bak-$TS" && echo "状态目录已备份为 /etc/v6edge.bak-$TS"',
 	'fi',
 	'',
-	'mkdir -p /usr/bin /usr/share/cfedge/defaults /usr/share/luci/menu.d /usr/share/rpcd/acl.d \\',
-	'         /www/luci-static/resources/view/cfedge /etc/cfedge/certs /etc/cfedge/acme',
-	'cp -f usr/bin/cfedge /usr/bin/cfedge',
-	'chmod 755 /usr/bin/cfedge',
-	'cp -f usr/share/cfedge/defaults/cfedge /usr/share/cfedge/defaults/cfedge',
-	'if [ ! -f /etc/config/cfedge ]; then',
-	'\tcp -f usr/share/cfedge/defaults/cfedge /etc/config/cfedge',
-	'\tchmod 600 /etc/config/cfedge',
-	'\techo "已写入默认配置 /etc/config/cfedge"',
+	'mkdir -p /usr/bin /usr/share/v6edge/defaults /usr/share/luci/menu.d /usr/share/rpcd/acl.d \\',
+	'         /www/luci-static/resources/view/v6edge /etc/v6edge/certs /etc/v6edge/acme',
+	'cp -f usr/bin/v6edge /usr/bin/v6edge',
+	'chmod 755 /usr/bin/v6edge',
+	'ln -sf /usr/bin/v6edge /usr/bin/cfedge 2>/dev/null || true',
+	'cp -f usr/share/v6edge/defaults/v6edge /usr/share/v6edge/defaults/v6edge',
+	'if [ ! -f /etc/config/v6edge ]; then',
+	'\tcp -f usr/share/v6edge/defaults/v6edge /etc/config/v6edge',
+	'\tchmod 600 /etc/config/v6edge',
+	'\techo "已写入默认配置 /etc/config/v6edge"',
 	'else',
-	'\techo "保留现有配置 /etc/config/cfedge"',
+	'\techo "保留现有配置 /etc/config/v6edge"',
 	'fi',
-	'cp -f usr/share/luci/menu.d/luci-app-cfedge.json /usr/share/luci/menu.d/luci-app-cfedge.json',
-	'cp -f usr/share/rpcd/acl.d/luci-app-cfedge.json /usr/share/rpcd/acl.d/luci-app-cfedge.json',
-	'cp -f www/luci-static/resources/view/cfedge/main.js /www/luci-static/resources/view/cfedge/main.js',
-	'chmod 644 /usr/share/luci/menu.d/luci-app-cfedge.json \\',
-	'          /usr/share/rpcd/acl.d/luci-app-cfedge.json \\',
-	'          /www/luci-static/resources/view/cfedge/main.js',
+	'cp -f usr/share/luci/menu.d/luci-app-v6edge.json /usr/share/luci/menu.d/luci-app-v6edge.json',
+	'cp -f usr/share/rpcd/acl.d/luci-app-v6edge.json /usr/share/rpcd/acl.d/luci-app-v6edge.json',
+	'cp -f www/luci-static/resources/view/v6edge/main.js /www/luci-static/resources/view/v6edge/main.js',
+	'chmod 644 /usr/share/luci/menu.d/luci-app-v6edge.json \\',
+	'          /usr/share/rpcd/acl.d/luci-app-v6edge.json \\',
+	'          /www/luci-static/resources/view/v6edge/main.js',
 	'rm -f /tmp/luci-indexcache* 2>/dev/null || true',
 	'/etc/init.d/rpcd restart >/dev/null 2>&1 || true',
-	'echo "cfedge ' + VER + ' 安装完成"',
-	'echo "下一步: cfedge init --zone <域名> --token <CF_TOKEN>（或直接在 LuCI 里点）"'
+	'echo "v6edge ' + VER + ' 安装完成"',
+	'echo "下一步: v6edge init --zone <域名> --token <CF_TOKEN>（或直接在 LuCI 里点）"'
 ].join('\n') + '\n';
 
 fs.mkdirSync(DIST, { recursive: true });
 
 /* ---------- bundle ---------- */
-const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'cfedge-stage-'));
+const stage = fs.mkdtempSync(path.join(os.tmpdir(), 'v6edge-stage-'));
 for (const [rel, src, mode] of CORE.concat(LUCI)) {
 	const dst = path.join(stage, rel);
 	fs.mkdirSync(path.dirname(dst), { recursive: true });
@@ -79,7 +80,7 @@ for (const [rel, src, mode] of CORE.concat(LUCI)) {
 fs.writeFileSync(path.join(stage, 'install.sh'), INSTALL_SH);
 fs.chmodSync(path.join(stage, 'install.sh'), 0o755);
 
-const bundle = path.join(DIST, `cfedge-${VER}-bundle.tar.gz`);
+const bundle = path.join(DIST, `v6edge-${VER}-bundle.tar.gz`);
 execSync(`tar -czf "${bundle}" -C "${stage}" .`, { stdio: 'inherit' });
 console.log('built', bundle, (fs.statSync(bundle).size / 1024).toFixed(1) + ' KB');
 
@@ -87,10 +88,10 @@ console.log('built', bundle, (fs.statSync(bundle).size / 1024).toFixed(1) + ' KB
 const payload = fs.readFileSync(bundle);
 const runHeader = [
 	'#!/bin/sh',
-	'# cfedge ' + VER + ' 自解压安装器',
-	'# 用法: sh cfedge-' + VER + '.run [--fresh]',
+	'# v6edge ' + VER + ' 自解压安装器',
+	'# 用法: sh v6edge-' + VER + '.run [--fresh]',
 	'set -e',
-	'TMP=$(mktemp -d /tmp/cfedge-run.XXXXXX)',
+	'TMP=$(mktemp -d /tmp/v6edge-run.XXXXXX)',
 	'MARK=$(awk \'/^__PAYLOAD_BELOW__$/{print NR+1; exit}\' "$0")',
 	'tail -n +"$MARK" "$0" > "$TMP/payload.tar.gz"',
 	'tar -xzf "$TMP/payload.tar.gz" -C "$TMP"',
@@ -100,7 +101,7 @@ const runHeader = [
 	'exit $rc',
 	'__PAYLOAD_BELOW__'
 ].join('\n') + '\n';
-const runPath = path.join(DIST, `cfedge-${VER}.run`);
+const runPath = path.join(DIST, `v6edge-${VER}.run`);
 fs.writeFileSync(runPath, Buffer.concat([Buffer.from(runHeader, 'utf8'), payload]));
 fs.chmodSync(runPath, 0o755);
 console.log('built', runPath, (fs.statSync(runPath).size / 1024).toFixed(1) + ' KB');
@@ -157,7 +158,7 @@ function buildIpk(file, pkgName, desc, deps, files, postinst) {
 		'Package: ' + pkgName,
 		'Version: ' + VER,
 		'Depends: ' + deps,
-		'Source: https://github.com/keduoli-lovely/cfedge',
+		'Source: https://github.com/keduoli-lovely/v6edge',
 		'SourceName: ' + pkgName,
 		'License: MIT',
 		'Section: net',
@@ -181,19 +182,19 @@ function buildIpk(file, pkgName, desc, deps, files, postinst) {
 }
 
 buildIpk(
-	path.join(DIST, `cfedge_${VER}-24_all.ipk`),
-	'cfedge',
+	path.join(DIST, `v6edge_${VER}-24_all.ipk`),
+	'v6edge',
 	'Cloudflare edge helper (AAAA + Let\'s Encrypt + nginx TLS, IPv6 only)',
 	'curl, ca-bundle, openssl-util',
 	CORE,
-	'#!/bin/sh\n[ -f /etc/config/cfedge ] || { cp -f /usr/share/cfedge/defaults/cfedge /etc/config/cfedge; chmod 600 /etc/config/cfedge; }\nmkdir -p /etc/cfedge/certs /etc/cfedge/acme\nexit 0\n'
+	'#!/bin/sh\n[ -f /etc/config/v6edge ] || { cp -f /usr/share/v6edge/defaults/v6edge /etc/config/v6edge; chmod 600 /etc/config/v6edge; }\nmkdir -p /etc/v6edge/certs /etc/v6edge/acme\nexit 0\n'
 );
 
 buildIpk(
-	path.join(DIST, `luci-app-cfedge_${VER}-24_all.ipk`),
-	'luci-app-cfedge',
-	'LuCI app for cfedge',
-	'cfedge, luci-base',
+	path.join(DIST, `luci-app-v6edge_${VER}-24_all.ipk`),
+	'luci-app-v6edge',
+	'LuCI app for v6edge',
+	'v6edge, luci-base',
 	LUCI,
 	'#!/bin/sh\nrm -f /tmp/luci-indexcache* 2>/dev/null\n/etc/init.d/rpcd restart >/dev/null 2>&1\nexit 0\n'
 );

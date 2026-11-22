@@ -3,12 +3,12 @@
 'require fs';
 'require ui';
 
-var CFEDGE = '/usr/bin/cfedge';
+var V6EDGE = '/usr/bin/v6edge';
 
 /* ---------------- 通用 ---------------- */
 
 function run(args) {
-	return fs.exec(CFEDGE, args).catch(function (e) {
+	return fs.exec(V6EDGE, args).catch(function (e) {
 		return { code: -1, stdout: '', stderr: String(e) };
 	});
 }
@@ -42,7 +42,7 @@ function act(args, okMsg) {
 		}
 		notify(okMsg || '完成', 'info');
 		run(['doctor', '--save']).then(function () {
-			if (window.__cfedge_refresh) window.__cfedge_refresh();
+			if (window.__v6edge_refresh) window.__v6edge_refresh();
 			else window.setTimeout(function () { location.reload(); }, 900);
 		});
 	});
@@ -92,8 +92,8 @@ function hideTip() {
 
 function tip(text) {
 	installTipCss();
-	if (!window.__cfedge_tip_closer) {
-		window.__cfedge_tip_closer = true;
+	if (!window.__v6edge_tip_closer) {
+		window.__v6edge_tip_closer = true;
 		document.addEventListener('click', hideTip);
 		window.addEventListener('scroll', hideTip, true);
 	}
@@ -238,7 +238,7 @@ return view.extend({
 				if (old) old.replaceWith(self.render(d)); else location.reload();
 			});
 		}
-		window.__cfedge_refresh = softRefresh;
+		window.__v6edge_refresh = softRefresh;
 
 		var zoneProvAddSel = E('select', {}, [
 			E('option', { 'value': 'cloudflare' }, 'Cloudflare'),
@@ -320,7 +320,7 @@ return view.extend({
 							if (!id) { notify(res.stderr || '创建凭据失败', 'danger', 8); return; }
 							run(['zone', 'set-cred', z.name, id]).then(function () {
 								notify('凭据已更新并绑定到 ' + z.name, 'info');
-								run(['doctor', '--save']).then(function () { if (window.__cfedge_refresh) window.__cfedge_refresh(); });
+								run(['doctor', '--save']).then(function () { if (window.__v6edge_refresh) window.__v6edge_refresh(); });
 							});
 						});
 					}}, '保存')
@@ -368,7 +368,7 @@ return view.extend({
 				E('div', { 'class': 'cbi-map cf-modal', 'style': 'width:380px;max-width:92vw' }, [
 					(s.landns === 'external' ? E('div', {
 						'style': 'margin:0 0 10px 0;padding:8px 10px;border-radius:6px;background:#fff4e0;color:#7a4a00;font-size:12px;line-height:1.5'
-					}, '局域网 DNS 不受 cfedge 控制。若你使用 AdGuard Home，请到「基础设置」配置 AdGuard，否则新域名在局域网可能无法解析。') : ''),
+					}, '局域网 DNS 不受 v6edge 控制。若你使用 AdGuard Home，请到「基础设置」配置 AdGuard，否则新域名在局域网可能无法解析。') : ''),
 					row('子域名', nameIn, HELP.name),
 					row('域名', zoneSel2, '服务挂在哪个根域名下（CF/阿里云上配置的 zone）。'),
 					row('内网目标', E('div', { 'class': 'cf-inline' }, [targetIn, probe]), HELP.target),
@@ -691,12 +691,12 @@ return E('div', { 'class': 'cf-page' }, [
 				'style': 'margin:0 1.25rem 12px 1.25rem;padding:12px 14px;border-radius:6px;' +
 					'border-left:4px solid #b3261e;background:#fde8e8;color:#7f1d1d'
 			}, [
-				E('strong', {}, '未检测到公网 IPv6，cfedge 暂不可用'),
+				E('strong', {}, '未检测到公网 IPv6，v6edge 暂不可用'),
 				E('ul', { 'style': 'margin:8px 0 8px 18px' }, [
 					E('li', {}, '光猫/上级路由是否开启 IPv6 并下发 /64 前缀'),
 					E('li', {}, 'iStoreOS 的 wan6 是否启用 DHCPv6/SLAAC'),
 					E('li', {}, '运营商是否已开通 IPv6'),
-					E('li', {}, '修好后点「重新检测」或运行 cfedge doctor')
+					E('li', {}, '修好后点「重新检测」或运行 v6edge doctor')
 				]),
 				E('button', { 'type': 'button', 'class': 'cbi-button cbi-button-apply', 'click': function () {
 					act(['doctor', '--save'], '已重新检测');

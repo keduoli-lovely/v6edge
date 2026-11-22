@@ -1,0 +1,30 @@
+{
+	"luci-app-v6edge": {
+		"description": "Grant access to v6edge (Cloudflare edge manager)",
+		"read": {
+			"file": {
+				"/usr/bin/v6edge": [ "exec" ],
+				"/etc/v6edge": [ "list" ],
+				"/etc/v6edge/*": [ "list", "read" ],
+				"/etc/nginx/conf.d/*": [ "list", "read" ],
+				"/etc/config/v6edge": [ "read" ]
+			},
+			"ubus": {
+				"file": [ "exec", "read", "list" ],
+				"uci": [ "get" ],
+				"service": [ "list" ]
+			},
+			"uci": [ "v6edge", "firewall", "nginx" ]
+		},
+		"write": {
+			"file": {
+				"/usr/bin/v6edge": [ "exec" ],
+				"/etc/v6edge/*": [ "write" ]
+			},
+			"ubus": {
+				"file": [ "exec" ]
+			},
+			"uci": [ "v6edge", "firewall", "nginx" ]
+		}
+	}
+}
