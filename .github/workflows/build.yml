@@ -1,0 +1,61 @@
+name: build
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build packages (${{ matrix.sdk }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - sdk: "24.10.0"
+            arch: x86_64
+            feeds: "https://downloads.openwrt.org/releases/24.10.0"
+          - sdk: "25.12.0"
+            arch: x86_64
+            feeds: "https://downloads.openwrt.org/releases/25.12.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare SDK
+        run: |
+          set -e
+          SDK_URL="${{ matrix.feeds }}/targets/${{ matrix.arch }}/openwrt-sdk-${{ matrix.sdk }}-${{ matrix.arch }}_gcc-*-linux-x86_64.tar.zst"
+          echo "SDK: $SDK_URL"
+          curl -fsSL -o sdk.tar.zst "$(curl -fsSL "${{ matrix.feeds }}/targets/${{ matrix.arch }}/" | grep -o 'openwrt-sdk-[^"]*linux-x86_64\.tar\.zst' | head -1 | sed "s#^#${{ matrix.feeds }}/targets/${{ matrix.arch }}/#")"
+          mkdir sdk && tar --zstd -xf sdk.tar.zst -C sdk --strip-components=1
+
+      - name: Add packages
+        run: |
+          set -e
+          cd sdk
+          mkdir -p package/cfedge
+          cp -r "$GITHUB_WORKSPACE/packages/"* package/cfedge/
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a || true
+          make defconfig
+
+      - name: Build
+        run: |
+          set -e
+          cd sdk
+          make package/cfedge/cfedge/compile V=s -j$(nproc) || \
+            make package/cfedge/compile V=s -j1
+          make package/luci-app-cfedge/compile V=s -j1 || true
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p out
+          find sdk/bin -type f \( -name 'cfedge*.ipk' -o -name 'luci-app-cfedge*.ipk' \
+            -o -name 'cfedge*.apk' -o -name 'luci-app-cfedge*.apk' \) -exec cp {} out/ \;
+          ls -l out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cfedge-${{ matrix.sdk }}
+          path: out/*

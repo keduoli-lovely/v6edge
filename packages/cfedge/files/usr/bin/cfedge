@@ -1,0 +1,1751 @@
+#!/bin/sh
+# ---------------------------------------------------------------------------
+# cfedge - Cloudflare 边缘反代/证书/DDNS 管理工具 (OpenWrt / iStoreOS)
+#
+# 用法:
+#   cfedge init                交互/参数初始化 (zone + token)
+#   cfedge doctor              自检
+#   cfedge cert [--force]      签发/续期证书
+#   cfedge add <name> <target> [port] [选项...]
+#   cfedge rm <name>           删除服务并回滚 (nginx/防火墙/DNS)
+#   cfedge list                列出服务
+#   cfedge ddns sync           立即同步所有域名 AAAA
+#   cfedge ddns status         查看 DDNS 状态
+#   cfedge ddns enable|disable 启停 DDNS 定时任务
+#   cfedge ddns add <fqdn>     额外维护的域名
+#   cfedge ddns rm <fqdn>
+#   cfedge status [--json]     LuCI 用的状态输出
+#   cfedge reload              重载 nginx (仅校验通过时)
+# ---------------------------------------------------------------------------
+set -u
+
+VERSION="0.1.0"
+CFG=/etc/config/cfedge
+STATE=/etc/cfedge
+CERTDIR="$STATE/certs"
+ACME_HOME="$STATE/acme"
+TOKEN_FILE="$STATE/token"
+IPFILE="$STATE/ip"
+LOGFILE="$STATE/cfedge.log"
+API="https://api.cloudflare.com/client/v4"
+DOH="https://doh.pub/dns-query"
+
+log()  { echo "[$(date '+%F %T')] $*" >> "$LOGFILE"; echo "$*"; }
+err()  { echo "cfedge: $*" >&2; echo "[$(date '+%F %T')] ERROR: $*" >> "$LOGFILE"; }
+die()  { err "$*"; exit 1; }
+need_root() { [ "$(id -u)" = "0" ] || die "需要 root 权限"; }
+
+# --- 配置读取 ---------------------------------------------------------------
+g() { uci -q get "cfedge.global.$1" 2>/dev/null; }
+zones() { uci -q get cfedge.global.zone 2>/dev/null; }
+
+load_global() {
+	migrate_zones
+	migrate_creds
+	ZONE=$(default_zone)
+	EDGE_PORT=$(g edge_port); EDGE_PORT=${EDGE_PORT:-8443}
+	CERT_MODE=$(g cert_mode); CERT_MODE=${CERT_MODE:-wildcard}
+	CERT_EMAIL=$(g cert_email)
+	DDNS_ENABLED=$(g ddns_enabled); DDNS_ENABLED=${DDNS_ENABLED:-1}
+	DDNS_INTERVAL=$(g ddns_interval); DDNS_INTERVAL=${DDNS_INTERVAL:-10}
+	[ -n "$ZONE" ] || die "尚未初始化，先运行: cfedge init --zone your.domain --token <CF_TOKEN>"
+}
+
+get_token() {
+	_c=$(zone_cred "$(crit)")
+	if [ -n "$_c" ]; then
+		_f=$(cred_secret_file "$_c")
+		[ -r "$_f" ] && { sed -n 1p "$_f"; return 0; }
+	fi
+	[ -r "$TOKEN_FILE" ] && { cat "$TOKEN_FILE"; return 0; }
+	die "该域名还没有配置 Cloudflare Token"
+}
+
+ali_id() {
+	_c=$(zone_cred "$(crit)")
+	[ -n "$_c" ] && { sed -n 1p "$(cred_secret_file "$_c")" 2>/dev/null; return 0; }
+	cat "$ALI_ID_FILE" 2>/dev/null
+}
+
+ali_secret() {
+	_c=$(zone_cred "$(crit)")
+	[ -n "$_c" ] && { sed -n 2p "$(cred_secret_file "$_c")" 2>/dev/null; return 0; }
+	cat "$ALI_SECRET_FILE" 2>/dev/null
+}
+
+# --- Cloudflare API ---------------------------------------------------------
+cf() { # cf METHOD PATH [BODY]
+	_method=$1; _path=$2; _body=${3:-}
+	_token=$(get_token)
+	if [ -n "$_body" ]; then
+		curl -sS -m 30 -X "$_method" -H "Authorization: Bearer $_token" \
+			-H 'Content-Type: application/json' --data "$_body" "$API$_path"
+	else
+		curl -sS -m 30 -X "$_method" -H "Authorization: Bearer $_token" "$API$_path"
+	fi
+}
+
+cf_zone_id() {
+	_z=${ZONE_CTX:-$ZONE}
+	mkdir -p "$STATE/zones" 2>/dev/null
+	_cache="$STATE/zones/$_z.id"
+	zid=$(cat "$_cache" 2>/dev/null)
+	if [ -n "$zid" ]; then echo "$zid"; return 0; fi
+	resp=$(cf GET "/zones?name=$_z")
+	zid=$(printf '%s' "$resp" | grep -o '"id":"[0-9a-f]*"' | head -1 | cut -d'"' -f4)
+	[ -n "$zid" ] || { err "拿不到 zone id（域名 $_z 不在当前凭据下）"; return 1; }
+	echo "$zid" > "$_cache"
+	echo "$zid"
+}
+
+# --- 网络 -------------------------------------------------------------------
+wan_dev() { ip -6 route show default 2>/dev/null | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1; }
+
+# 只认真·公网 IPv6：排除 ULA(fd00::/8)、链路本地、回环
+ipv6_public() {
+	_dev=$(wan_dev)
+	[ -n "$_dev" ] || return 1
+	ip -6 -o addr show dev "$_dev" scope global 2>/dev/null |
+		awk '{ n=split($4,a,"/"); ip=a[1];
+		       if (ip ~ /^fd[0-9a-f][0-9a-f]:/) next
+		       if (ip ~ /^fe[89ab]/) next
+		       if (a[2] == 64 && !p) p = ip
+		       if (!f) f = ip }
+		     END { print (p != "" ? p : f) }'
+}
+
+ipv6_ula() {
+	_dev=$(wan_dev)
+	ip -6 -o addr show dev "$_dev" scope global 2>/dev/null |
+		awk '{ n=split($4,a,"/"); if (a[1] ~ /^fd[0-9a-f][0-9a-f]:/) { print a[1]; exit } }'
+}
+
+ipv6_route_ok() { ip -6 route show default 2>/dev/null | grep -q .; }
+
+ipv6_ping_ok() {
+	ping -6 -c 1 -W 3 2400:3200::1 >/dev/null 2>&1 && return 0
+	ping6 -c 1 -W 3 2400:3200::1 >/dev/null 2>&1 && return 0
+	return 1
+}
+
+# 输出 ok | no-addr | no-route | no-ping，供 doctor/status/门禁共用
+ipv6_status() {
+	[ -n "$(ipv6_public)" ] || { echo no-addr; return 0; }
+	ipv6_route_ok || { echo no-route; return 0; }
+	echo ok
+}
+
+require_ipv6() {
+	case "$(ipv6_status)" in
+	ok) return 0 ;;
+	no-addr)
+		die "没有公网 IPv6，cfedge 暂不可用。请依次检查：1) 光猫/上级路由是否开启 IPv6 且下发前缀 2) iStoreOS 的 WAN6 是否启用（DHCPv6/SLAAC） 3) 运营商是否开通 IPv6。修好后运行 cfedge doctor 复检" ;;
+	no-route) die "有 IPv6 地址但没有默认路由，请检查 WAN6/DHCPv6 客户端状态（cfedge doctor 查看详情）" ;;
+	esac
+}
+
+
+ipv6_addr() {
+	dev=$(wan_dev)
+	[ -n "$dev" ] || return 1
+	ip -6 -o addr show dev "$dev" scope global 2>/dev/null |
+		awk '{ n=split($4,a,"/"); if (a[1] !~ /:/) next
+		       if (a[2] == 64 && !p) p = a[1]
+		       if (!f) f = a[1] }
+		     END { print (p != "" ? p : f) }'
+}
+
+# --- DNS provider 抽象（cloudflare / aliyun）---
+ALI_ID_FILE="$STATE/aliyun.keyid"
+ALI_SECRET_FILE="$STATE/aliyun.secret"
+
+provider() {
+	_z=$(crit)
+	_c=$(zone_cred "$_z")
+	if [ -n "$_c" ]; then
+		_p=$(cred_provider "$_c")
+		[ -n "$_p" ] && { echo "$_p"; return 0; }
+	fi
+	_s=$(zone_sec "$_z" 2>/dev/null)
+	_p=$(zone_get "$_s" provider)
+	[ -n "$_p" ] || _p=$(g provider)
+	echo "${_p:-cloudflare}"
+}
+
+provider_label() {
+	case "$(provider)" in
+	cloudflare) echo "Cloudflare" ;;
+	aliyun) echo "阿里云 DNS" ;;
+	*) echo "$(provider)" ;;
+	esac
+}
+
+creds_ok() {
+	_c=$(zone_cred "$(crit)")
+	if [ -n "$_c" ] && [ -s "$(cred_secret_file "$_c")" ]; then
+		return 0
+	fi
+	case "$(provider)" in
+	cloudflare) [ -r "$TOKEN_FILE" ] ;;
+	aliyun) [ -r "$ALI_ID_FILE" ] && [ -r "$ALI_SECRET_FILE" ] ;;
+	*) return 1 ;;
+	esac
+}
+
+p_dns_hook() {
+	case "$(provider)" in
+	aliyun) echo dns_ali ;;
+	*) echo dns_cf ;;
+	esac
+}
+
+# --- Cloudflare ---
+cf_dns_find() { # cf_dns_find FQDN -> "id content"
+	zid=$(cf_zone_id)
+	resp=$(cf GET "/zones/$zid/dns_records?type=AAAA&name=$1")
+	case "$resp" in *'"success":true'*) ;; *) return 1 ;; esac
+	rid=$(printf '%s' "$resp" | grep -o '"id":"[0-9a-f]*"' | head -1 | cut -d'"' -f4)
+	rip=$(printf '%s' "$resp" | grep -o '"content":"[^"]*"' | head -1 | cut -d'"' -f4)
+	[ -n "$rid" ] || return 1
+	echo "$rid $rip"
+}
+
+cf_dns_ensure() {
+	fqdn=$1; ip=$2
+	zid=$(cf_zone_id)
+	found=$(cf_dns_find "$fqdn")
+	if [ -n "$found" ]; then
+		rid=${found%% *}; rip=${found#* }
+		[ "$rip" = "$ip" ] && return 0
+		resp=$(cf PATCH "/zones/$zid/dns_records/$rid" "{\"content\":\"$ip\"}")
+		case "$resp" in
+		*'"success":true'*) log "DNS 更新 $fqdn: $rip -> $ip" ;;
+		*) err "DNS 更新失败 $fqdn: $(printf '%s' "$resp" | head -c 200)" ; return 1 ;;
+		esac
+	else
+		resp=$(cf POST "/zones/$zid/dns_records" \
+			"{\"type\":\"AAAA\",\"name\":\"$fqdn\",\"content\":\"$ip\",\"ttl\":300,\"proxied\":false}")
+		case "$resp" in
+		*'"success":true'*) log "DNS 新建 $fqdn -> $ip" ;;
+		*) err "DNS 新建失败 $fqdn: $(printf '%s' "$resp" | head -c 200)" ; return 1 ;;
+		esac
+	fi
+}
+
+cf_dns_delete() {
+	zid=$(cf_zone_id)
+	found=$(cf_dns_find "$1")
+	[ -n "$found" ] || return 0
+	rid=${found%% *}
+	cf DELETE "/zones/$zid/dns_records/$rid" >/dev/null
+	log "DNS 删除 $1"
+}
+
+# --- 阿里云 DNS（RPC 签名，HMAC-SHA1）---
+ali_pct() { # RFC3986 percent-encode
+	awk -v s="$1" 'BEGIN{
+		for (i = 1; i < 127; i++) ord[sprintf("%c", i)] = i;
+		out = ""; n = length(s);
+		for (i = 1; i <= n; i++) {
+			c = substr(s, i, 1);
+			if (c ~ /[A-Za-z0-9._~-]/) out = out c;
+			else out = out sprintf("%%%02X", ord[c]);
+		}
+		printf "%s", out
+	}'
+}
+
+ali_api() { # ali_api Action "k=v" ["k=v"...]
+	_action=$1; shift
+	_tmp=/tmp/cfedge.ali.$$
+	_ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+	_nonce=$(cat /proc/sys/kernel/random/uuid 2>/dev/null | tr -d "-")
+	{
+		echo "AccessKeyId=$(ali_id)"
+		echo "Action=$_action"
+		echo "Format=JSON"
+		echo "SignatureMethod=HMAC-SHA1"
+		echo "SignatureNonce=$_nonce"
+		echo "SignatureVersion=1.0"
+		echo "Timestamp=$_ts"
+		echo "Version=2015-01-09"
+		for _kv in "$@"; do echo "$_kv"; done
+	} | LC_ALL=C sort | while IFS="=" read -r _k _v; do
+		printf "%s=%s\n" "$_k" "$(ali_pct "$_v")"
+	done > "$_tmp"
+	_canon=$(awk 'BEGIN{ORS=""} NR>1{printf "&"} {printf "%s", $0}' "$_tmp")
+	_sts="GET&%2F&$(ali_pct "$_canon")"
+	_sig=$(printf "%s" "$_sts" | openssl dgst -sha1 -hmac "$(ali_secret)&" -binary | openssl base64 -A)
+	_out=$(curl -s -m 20 "https://alidns.aliyuncs.com/?$_canon&Signature=$(ali_pct "$_sig")")
+	rm -f "$_tmp"
+	printf "%s" "$_out"
+}
+
+ali_rr() {
+	case "$1" in
+	*."$ZONE") echo "${1%."$ZONE"}" ;;
+	"$ZONE") echo "@" ;;
+	*) echo "" ;;
+	esac
+}
+
+ali_zone_check() {
+	_r=$(ali_api DescribeDomainInfo "DomainName=$ZONE")
+	case "$_r" in
+	*'"DomainName"'*) return 0 ;;
+	*InvalidAccessKeyId*) err "阿里云 AccessKey ID 无效"; return 1 ;;
+	*SignatureDoesNotMatch*) err "阿里云签名不匹配：检查 AccessKey Secret"; return 1 ;;
+	*) err "阿里云域名检查失败: $(printf "%s" "$_r" | head -c 160)"; return 1 ;;
+	esac
+}
+
+ali_dns_find() {
+	_rr=$(ali_rr "$1")
+	[ -n "$_rr" ] || return 1
+	_r=$(ali_api DescribeDomainRecords "DomainName=$ZONE" "RRKeyWord=$_rr" "Type=AAAA" "SearchMode=EXACT")
+	_id=$(printf "%s" "$_r" | grep -o '"RecordId":"[^"]*"' | head -1 | cut -d'"' -f4)
+	_val=$(printf "%s" "$_r" | grep -o '"Value":"[^"]*"' | head -1 | cut -d'"' -f4)
+	[ -n "$_id" ] || return 1
+	echo "$_id $_val"
+}
+
+ali_dns_ensure() {
+	_f=$1; _ip=$2; _rr=$(ali_rr "$_f")
+	[ -n "$_rr" ] || die "域名 $_f 不属于 $ZONE"
+	_found=$(ali_dns_find "$_f" || true)
+	if [ -n "$_found" ]; then
+		_id=${_found%% *}; _cur=${_found#* }
+		[ "$_cur" = "$_ip" ] && return 0
+		_r=$(ali_api UpdateDomainRecord "RecordId=$_id" "RR=$_rr" "Type=AAAA" "Value=$_ip" "TTL=600")
+	else
+		_r=$(ali_api AddDomainRecord "DomainName=$ZONE" "RR=$_rr" "Type=AAAA" "Value=$_ip" "TTL=600")
+	fi
+	case "$_r" in
+	*'"RecordId"'*) log "阿里云 DNS: $_f -> $_ip"; return 0 ;;
+	*) err "阿里云 DNS 写入失败 $_f: $(printf "%s" "$_r" | head -c 160)"; return 1 ;;
+	esac
+}
+
+ali_dns_delete() {
+	_found=$(ali_dns_find "$1" || true)
+	[ -n "$_found" ] || return 0
+	_id=${_found%% *}
+	ali_api DeleteDomainRecord "RecordId=$_id" >/dev/null
+	log "阿里云 DNS 删除 $1"
+}
+
+# --- 统一入口 ---
+dns_find() {
+	case "$(provider)" in
+	aliyun) ali_dns_find "$@" ;;
+	*) cf_dns_find "$@" ;;
+	esac
+}
+
+dns_ensure() {
+	case "$(provider)" in
+	aliyun) ali_dns_ensure "$@" ;;
+	*) cf_dns_ensure "$@" ;;
+	esac
+}
+
+dns_delete() {
+	case "$(provider)" in
+	aliyun) ali_dns_delete "$@" ;;
+	*) cf_dns_delete "$@" ;;
+	esac
+}
+
+zone_id() {
+	case "$(provider)" in
+	aliyun) echo "$ZONE" ;;
+	*) cf_zone_id ;;
+	esac
+}
+
+# --- 证书 -------------------------------------------------------------------
+acme_bin() {
+	for p in /usr/lib/acme/client/acme.sh /usr/bin/acme.sh /usr/share/acme.sh/acme.sh; do
+		[ -x "$p" ] && { echo "$p"; return 0; }
+	done
+	return 1
+}
+
+cert_paths() { # cert_paths FQDN -> "crt key"
+	_f=$1
+	_z=$(zone_for_fqdn "$_f")
+	if [ "$(zone_cert_mode "$_z")" = "wildcard" ]; then
+		echo "$CERTDIR/$_z.crt $CERTDIR/$_z.key"
+	else
+		echo "$CERTDIR/$_f.crt $CERTDIR/$_f.key"
+	fi
+}
+
+cert_issue() { # cert_issue <zone>（通配符）或 <fqdn>（逐域名）
+	_arg=$1
+	ACME=$(acme_bin) || die "缺少 acme.sh，请安装 acme-acmesh + acme-acmesh-dnsapi"
+	mkdir -p "$CERTDIR" "$ACME_HOME"
+	if zone_sec "$_arg" >/dev/null 2>&1; then
+		_z=$_arg
+	elif [ "$(zone_cert_mode "$(zone_for_fqdn "$_arg")")" = "wildcard" ]; then
+		_z=$(zone_for_fqdn "$_arg")
+	else
+		_z=""
+	fi
+	_hook=$(ZONE_CTX="${_z:-$(default_zone)}"; p_dns_hook)
+	if [ -n "$_z" ]; then
+		_dom="*.$_z"; _extra="$_z"; _name="*.$_z"
+		targets="$CERTDIR/$_z.crt $CERTDIR/$_z.key"
+	else
+		_dom="$_arg"; _extra=""; _name="$_arg"
+		targets="$CERTDIR/$_arg.crt $CERTDIR/$_arg.key"
+	fi
+	set -- "$ACME" --issue --dns "$_hook" --home "$ACME_HOME" -k ec-256 --server letsencrypt -d "$_dom"
+	[ -n "$_extra" ] && set -- "$@" -d "$_extra"
+	_env_zone=${_z:-$(default_zone)}
+	_cf_token=$(ZONE_CTX="$_env_zone"; get_token 2>/dev/null)
+	_ali_key=$(ZONE_CTX="$_env_zone"; ali_id 2>/dev/null)
+	_ali_sec=$(ZONE_CTX="$_env_zone"; ali_secret 2>/dev/null)
+	CF_Token="$_cf_token" Ali_Key="$_ali_key" Ali_Secret="$_ali_sec" "$@" >/dev/null 2>&1
+	_rc=$?
+	# acme 返回 2 表示“证书仍有效/无需续期”，也算成功
+	if [ "$_rc" != "0" ] && [ "$_rc" != "2" ]; then
+		err "证书签发失败: $_name (rc=$_rc，看 $ACME_HOME/acme.sh.log)"
+		return 1
+	fi
+	set -- "$ACME" --install-cert -d "$_dom" --ecc --home "$ACME_HOME"
+	set -- "$@" --key-file "${targets#* }" --fullchain-file "${targets%% *}" --reloadcmd "cfedge reload >/dev/null 2>&1"
+	"$@" >/dev/null 2>&1
+	log "证书就绪: $_name"
+	ensure_cron "23 3 * * * $ACME --cron --home $ACME_HOME >/dev/null 2>&1"
+}
+
+cert_covered() { # cert_covered FQDN -> 0/1（支持通配符证书）
+	crt=$(cert_paths "$1"); crt=${crt%% *}
+	[ -s "$crt" ] || return 1
+	san=$(openssl x509 -in "$crt" -noout -ext subjectAltName 2>/dev/null)
+	case "$san" in *"DNS:$1"*) return 0 ;; esac
+	# 去掉最左边一级，尝试通配符
+	rest=$(echo "$1" | sed 's/^[^.]*\.//')
+	case "$san" in *"DNS:*.$rest"*) return 0 ;; esac
+	return 1
+}
+
+# --- 防火墙 -----------------------------------------------------------------
+fw_ensure() { # fw_ensure PORT
+	port=$1
+	uci -q get "firewall.cfedge_$port" >/dev/null 2>&1 && return 0
+	uci set "firewall.cfedge_$port=rule"
+	uci set "firewall.cfedge_$port.name=cfedge-$port"
+	uci set "firewall.cfedge_$port.src=wan"
+	uci set "firewall.cfedge_$port.proto=tcp"
+	uci set "firewall.cfedge_$port.dest_port=$port"
+	uci set "firewall.cfedge_$port.family=ipv6"
+	uci set "firewall.cfedge_$port.target=ACCEPT"
+	uci commit firewall
+	log "防火墙放行 wan ipv6 tcp/$port"
+}
+
+fw_remove_unused() {
+	used=" "
+	for s in $(service_names); do
+		[ "$(svc_get "$s" enabled)" = "0" ] && continue
+		p=$(svc_port "$s")
+		[ "$(svc_get "$s" lan_only)" = "1" ] && continue
+		used="$used$p "
+	done
+	for sec in $(uci show firewall 2>/dev/null | sed -n 's/^firewall\.\(cfedge_[0-9]*\)=rule$/\1/p'); do
+		p=${sec#cfedge_}
+		case "$used" in
+		*" $p "*) ;;
+		*) uci -q delete "firewall.$sec"; uci commit firewall; log "防火墙删除未使用的端口 $p" ;;
+		esac
+	done
+}
+
+# --- cron -------------------------------------------------------------------
+ensure_cron() { # ensure_cron "LINE"
+	grep -qF "$1" /etc/crontabs/root 2>/dev/null && return 0
+	echo "$1" >> /etc/crontabs/root
+	/etc/init.d/cron restart >/dev/null 2>&1 || /etc/init.d/crond restart >/dev/null 2>&1
+	log "cron 添加: $1"
+}
+
+drop_cron() { # drop_cron "PATTERN"
+	[ -f /etc/crontabs/root ] || return 0
+	grep -vF "$1" /etc/crontabs/root > /tmp/cfedge.cron.$$ || true
+	mv /tmp/cfedge.cron.$$ /etc/crontabs/root
+	chmod 600 /etc/crontabs/root
+	/etc/init.d/cron restart >/dev/null 2>&1 || true
+}
+
+# --- 服务管理 ---------------------------------------------------------------
+service_names() {
+	uci show cfedge 2>/dev/null | sed -n 's/^cfedge\.\([^.=]*\)=service$/\1/p'
+}
+
+# 用户看见的名字（带中划线）和 UCI section 名（只允许 [a-zA-Z0-9_]）分开
+sec_of() { # sec_of <名字或 section>
+	for s in $(service_names); do
+		[ "$s" = "$1" ] && { echo "$s"; return 0; }
+		[ "$(uci -q get "cfedge.$s.domain")" = "$1" ] && { echo "$s"; return 0; }
+	done
+	return 1
+}
+
+svc_get() { uci -q get "cfedge.$1.$2" 2>/dev/null; }
+
+# --- zone（多根域名）管理 ---
+zone_names() { uci show cfedge 2>/dev/null | sed -n 's/^cfedge\.\([^.]*\)=zone$/\1/p'; }
+zone_get() { uci -q get "cfedge.$1.$2" 2>/dev/null; }
+zone_sec() {
+	for z in $(zone_names); do
+		[ "$(zone_get "$z" name)" = "$1" ] && { echo "$z"; return 0; }
+	done
+	return 1
+}
+zone_names_list() { for z in $(zone_names); do zone_get "$z" name; done; }
+default_zone() {
+	_d=$(g default_zone)
+	[ -n "$_d" ] && { echo "$_d"; return 0; }
+	_d=$(g zone)
+	[ -n "$_d" ] && { echo "$_d"; return 0; }
+	zone_names_list | head -1
+}
+zone_of_service() {
+	_z=$(svc_get "$1" zone)
+	[ -n "$_z" ] || _z=$(default_zone)
+	echo "$_z"
+}
+zone_provider() {
+	_s=$(zone_sec "$1" 2>/dev/null)
+	_p=$(zone_get "$_s" provider)
+	[ -n "$_p" ] || _p=$(g provider)
+	echo "${_p:-cloudflare}"
+}
+zone_cert_mode() {
+	_s=$(zone_sec "$1" 2>/dev/null)
+	_m=$(zone_get "$_s" cert_mode)
+	[ -n "$_m" ] || _m=$(g cert_mode)
+	echo "${_m:-wildcard}"
+}
+zone_for_fqdn() {
+	for z in $(zone_names_list); do
+		case "$1" in *."$z") echo "$z"; return 0 ;; esac
+	done
+	echo "$1" | sed 's/^[^.]*\.//'
+}
+# --- 凭据（cred）管理：一个 cred = 一套 provider 密钥，可被多个 zone 共用 ---
+cred_ids() { uci show cfedge 2>/dev/null | sed -n 's/^cfedge\.\([^.]*\)=cred$/\1/p'; }
+cred_get() { uci -q get "cfedge.$1.$2" 2>/dev/null; }
+cred_secret_file() { echo "$STATE/creds/$1"; }
+cred_provider() { cred_get "$1" provider; }
+cred_label() { cred_get "$1" label; }
+cred_zones() {
+	for z in $(zone_names); do
+		[ "$(uci -q get "cfedge.$z.cred")" = "$1" ] && zone_get "$z" name
+	done
+}
+zone_cred() {
+	_s=$(zone_sec "$1" 2>/dev/null)
+	uci -q get "cfedge.$_s.cred" 2>/dev/null
+}
+crit() { echo "${ZONE_CTX:-$(default_zone)}"; }
+cred_masked() {
+	[ -n "$1" ] || { echo ""; return 0; }
+	_f=$(cred_secret_file "$1"); [ -r "$_f" ] || { echo ""; return; }
+	_a=$(sed -n 1p "$_f"); _b=$(sed -n 2p "$_f")
+	if [ -n "$_b" ]; then echo "$_a/******"; else echo "$(echo "$_a" | cut -c1-6)******"; fi
+}
+
+migrate_creds() {
+	[ -n "$(cred_ids)" ] && return 0
+	[ -r "$TOKEN_FILE" ] || return 0
+	mkdir -p "$STATE/creds"
+	cp -f "$TOKEN_FILE" "$STATE/creds/cred1"
+	chmod 600 "$STATE/creds/cred1"
+	uci set "cfedge.cred1=cred"
+	uci set "cfedge.cred1.provider=$(g provider)"
+	uci set "cfedge.cred1.label=默认凭据"
+	_s=$(zone_sec "$(default_zone)" 2>/dev/null)
+	[ -n "$_s" ] && uci set "cfedge.$_s.cred=cred1"
+	uci commit cfedge
+	return 0
+}
+
+migrate_zones() {
+	[ -n "$(zone_names)" ] && return 0
+	_z=$(g zone)
+	[ -n "$_z" ] || return 0
+	_sec="z_$(echo "$_z" | tr '.' '_' | sed 's/[^a-z0-9_]/_/g')"
+	uci set "cfedge.$_sec=zone"
+	uci set "cfedge.$_sec.name=$_z"
+	uci set "cfedge.$_sec.provider=$(g provider)"
+	uci set "cfedge.$_sec.cert_mode=$(g cert_mode)"
+	uci set "cfedge.$_sec.edge_port=$(g edge_port)"
+	uci set cfedge.global.default_zone="$_z"
+	if [ ! -s "$STATE/creds/cred1" ] && [ -r "$TOKEN_FILE" ]; then
+		mkdir -p "$STATE/creds"
+		cp -f "$TOKEN_FILE" "$STATE/creds/cred1"
+		chmod 600 "$STATE/creds/cred1"
+		uci set "cfedge.cred1=cred"
+		uci set "cfedge.cred1.provider=$(g provider)"
+		uci set "cfedge.cred1.label=默认凭据"
+		uci set "cfedge.$_sec.cred=cred1"
+	fi
+	for s in $(service_names); do
+		[ -n "$(svc_get "$s" zone)" ] || uci set "cfedge.$s.zone=$_z"
+	done
+	uci commit cfedge
+	mkdir -p "$STATE/zones" 2>/dev/null
+	if [ -s "$STATE/zone.id" ] && [ ! -s "$STATE/zones/$_z.id" ]; then
+		cp -f "$STATE/zone.id" "$STATE/zones/$_z.id"
+	fi
+	if [ -f "$CERTDIR/wildcard.crt" ] && [ ! -f "$CERTDIR/$_z.crt" ]; then
+		cp -f "$CERTDIR/wildcard.crt" "$CERTDIR/$_z.crt"
+		cp -f "$CERTDIR/wildcard.key" "$CERTDIR/$_z.key"
+		chmod 600 "$CERTDIR/$_z.key"
+	fi
+	return 0
+}
+
+svc_fqdn() {
+	local d z
+	d=$(svc_get "$1" domain)
+	[ -n "$d" ] || d=$1
+	case "$d" in
+	*.*) echo "$d"; return 0 ;;
+	esac
+	z=$(zone_of_service "$1")
+	echo "$d.$z"
+}
+
+svc_port() {
+	local p
+	p=$(svc_get "$1" port)
+	case "$p" in
+	""|edge) echo "$EDGE_PORT" ;;
+	*) echo "$p" ;;
+	esac
+}
+
+svc_backend() {
+	local t scheme
+	t=$(svc_get "$1" target)
+	scheme=$(svc_get "$1" scheme); scheme=${scheme:-http}
+	case "$t" in
+	*://*) echo "$t" ;;
+	*) echo "$scheme://$t" ;;
+	esac
+}
+
+render_service() { # render_service NAME
+	name=$1
+	fqdn=$(svc_fqdn "$name")
+	port=$(svc_port "$name")
+	backend=$(svc_backend "$name")
+	lan_only=$(svc_get "$name" lan_only); lan_only=${lan_only:-0}
+	ws=$(svc_get "$name" ws); ws=${ws:-1}
+	large=$(svc_get "$name" large); large=${large:-0}
+	hsts=$(svc_get "$name" hsts); hsts=${hsts:-1}
+	deny_post=$(svc_get "$name" deny_post)
+	paths=$(cert_paths "$fqdn"); crt=${paths%% *}; key=${paths#* }
+	out="/etc/nginx/conf.d/cfedge-$name.conf"
+
+	{
+		echo "# 由 cfedge 生成，请勿手工修改（cfedge 会覆盖）。修改: cfedge rm $name && cfedge add ..."
+		echo "server {"
+		echo "    listen $port ssl;"
+		echo "    listen [::]:$port ssl;"
+		echo "    http2 on;"
+		echo "    server_name $fqdn;"
+		echo "    ssl_certificate     $crt;"
+		echo "    ssl_certificate_key $key;"
+		echo "    ssl_protocols       TLSv1.2 TLSv1.3;"
+		echo "    ssl_session_cache   shared:SSL:10m;"
+		echo "    error_page 497 =301 https://\$host:\$server_port\$request_uri;"
+		[ "$hsts" = "1" ] && echo "    add_header Strict-Transport-Security \"max-age=31536000\" always;"
+		if [ "$lan_only" = "1" ]; then
+			echo "    # 仅局域网"
+			echo "    allow 192.168.0.0/16;"
+			echo "    allow 10.0.0.0/8;"
+			echo "    allow 172.16.0.0/12;"
+			echo "    allow fd00::/8;"
+			echo "    allow fe80::/10;"
+			echo "    allow 127.0.0.0/8;"
+			echo "    allow ::1;"
+			echo "    deny  all;"
+		fi
+		if [ "$large" = "1" ]; then
+			echo "    client_max_body_size 0;"
+			echo "    proxy_buffering off;"
+			echo "    proxy_request_buffering off;"
+			echo "    proxy_max_temp_file_size 0;"
+		fi
+		if [ -n "$deny_post" ]; then
+			for p in $(echo "$deny_post" | tr ',' ' '); do
+				echo "    # cfedge: 禁止该路径的 POST（例如 Immich 公网关闭密码登录）"
+				echo "    location = $p {"
+				echo "        if (\$request_method = POST) { return 403; }"
+				echo "        proxy_pass $backend;"
+				echo "        proxy_http_version 1.1;"
+				echo "        proxy_set_header Host              \$http_host;"
+				echo "        proxy_set_header X-Real-IP         \$remote_addr;"
+				echo "        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;"
+				echo "        proxy_set_header X-Forwarded-Proto https;"
+				echo "    }"
+			done
+		fi
+		echo "    location / {"
+		echo "        proxy_pass $backend;"
+		echo "        proxy_http_version 1.1;"
+		echo "        proxy_set_header Host              \$http_host;"
+		echo "        proxy_set_header X-Real-IP         \$remote_addr;"
+		echo "        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;"
+		echo "        proxy_set_header X-Forwarded-Proto https;"
+		[ "$ws" = "1" ] && {
+			echo "        proxy_set_header Upgrade           \$http_upgrade;"
+			echo "        proxy_set_header Connection        \"upgrade\";"
+		}
+		echo "        proxy_read_timeout  3600s;"
+		echo "        proxy_send_timeout  3600s;"
+		echo "        proxy_connect_timeout 10s;"
+		echo "    }"
+		echo "}"
+	} > "$out.tmp" && mv "$out.tmp" "$out"
+	log "已生成 $out ($fqdn:$port -> $backend)"
+}
+
+nginx_test() { nginx -t -c /etc/nginx/uci.conf >/dev/null 2>&1 || nginx -t >/dev/null 2>&1; }
+
+reload_nginx() {
+	nginx_test || { err "nginx 配置校验失败"; return 1; }
+	if pidof nginx >/dev/null 2>&1; then
+		/etc/init.d/nginx reload >/dev/null 2>&1 || /etc/init.d/nginx restart >/dev/null 2>&1
+	else
+		/etc/init.d/nginx enable >/dev/null 2>&1
+		/etc/init.d/nginx start >/dev/null 2>&1
+	fi
+	log "nginx 已重载"
+}
+
+service_apply() { # service_apply NAME
+	name=$1
+	fqdn=$(svc_fqdn "$name")
+	_zone=$(zone_of_service "$name")
+	port=$(svc_port "$name")
+	# 证书
+	[ -s "$(cert_paths "$fqdn" | cut -d' ' -f1)" ] || cert_issue "$fqdn" || return 1
+	# nginx
+	render_service "$name" || return 1
+	# 防火墙
+	if [ "$(svc_get "$name" lan_only)" != "1" ]; then fw_ensure "$port"; fi
+	# DDNS 记录
+	if [ "$DDNS_ENABLED" = "1" ]; then
+		ZONE_CTX=$_zone; dns_ensure "$fqdn" "$(ipv6_public)" >/dev/null 2>&1; ZONE_CTX=""
+	fi
+	# 局域网 DNS
+	case "$(lan_dns_mode)" in
+	router) lan_dns_router_on >/dev/null 2>&1 ;;
+	adguard) ag_ensure "*.$_zone" ;;
+	esac
+	reload_nginx
+}
+
+# --- 子命令 -----------------------------------------------------------------
+# --- AdGuard Home 局域网重写（可选）---
+AG_PASS_FILE="$STATE/adguard.pass"
+ag_url() { g ag_url; }
+ag_user() { g ag_user; }
+ag_enabled() { [ -n "$(ag_url)" ] && [ -s "$AG_PASS_FILE" ]; }
+
+ag_api() { # ag_api METHOD PATH [BODY]
+	if [ -n "${3:-}" ]; then
+		curl -s -m 10 -u "$(ag_user):$(cat "$AG_PASS_FILE")" -X "$1" \
+			-H 'Content-Type: application/json' --data "$3" "$(ag_url)$2"
+	else
+		curl -s -m 10 -u "$(ag_user):$(cat "$AG_PASS_FILE")" -X "$1" "$(ag_url)$2"
+	fi
+}
+
+lan_ip() {
+	_i=$(uci -q get network.lan.ipaddr 2>/dev/null)
+	[ -n "$_i" ] && { echo "$_i"; return 0; }
+	ip -4 -o addr show br-lan 2>/dev/null | awk 'NR==1{split($4,a,"/");print a[1]}'
+}
+
+ag_has() { ag_api GET /control/rewrite/list | grep -q "\"domain\": *\"$1\""; }
+
+ag_ensure() { # ag_ensure FQDN
+	ag_enabled || return 0
+	_a=$(lan_ip)
+	[ -n "$_a" ] || return 1
+	ag_has "$1" && return 0
+	ag_api POST /control/rewrite/add "{\"domain\":\"$1\",\"answer\":\"$_a\"}" >/dev/null 2>&1
+	log "AdGuard 重写: $1 -> $_a"
+}
+
+ag_delete() { # ag_delete FQDN
+	ag_enabled || return 0
+	_a=$(lan_ip)
+	ag_api POST /control/rewrite/delete "{\"domain\":\"$1\",\"answer\":\"$_a\"}" >/dev/null 2>&1
+	log "AdGuard 重写删除: $1"
+}
+
+# --- 局域网 DNS 模式 ---
+# router  = DHCP 把 DNS 指给路由器自己（dnsmasq），一条泛解析覆盖所有子域
+# adguard = DHCP 把 DNS 指给 AdGuard Home，需要逐域名重写
+# external= 指向公共 DNS（如 223.5.5.5），局域网会拿到公网 AAAA
+lan_dns_servers() {
+	_d=$(uci -q get dhcp.lan.dhcp_option 2>/dev/null)
+	_list=""
+	for _o in $_d; do
+		case "$_o" in
+		6,*) _list="$_list $(echo "$_o" | cut -d, -f2- | tr "," " ")" ;;
+		esac
+	done
+	for _x in $(uci -q get dhcp.lan.dns 2>/dev/null); do _list="$_list $_x"; done
+	echo $_list
+}
+
+lan_dns_mode() {
+	_lip=$(lan_ip)
+	_s=$(lan_dns_servers)
+	[ -z "$_s" ] && { echo router; return 0; }
+	for _a in $_s; do
+		[ "$_a" = "$_lip" ] && { echo router; return 0; }
+	done
+	_aghost=$(ag_url | sed "s#^[a-z]*://##; s#/.*##; s#:.*##")
+	[ -n "$_aghost" ] && for _a in $_s; do
+		[ "$_a" = "$_aghost" ] && { echo adguard; return 0; }
+	done
+	echo external
+}
+
+lan_dns_router_on() {
+	_lip=$(lan_ip)
+	[ -n "$_lip" ] || return 1
+	_n=0
+	for _z in $(zone_names_list); do
+		_rule="/$_z/$_lip"
+		_have=$(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null | grep -c -x -F "$_rule")
+		[ "$_have" = "0" ] && { uci add_list "dhcp.@dnsmasq[0].address=$_rule"; _n=$((_n+1)); }
+	done
+	if [ "$_n" -gt 0 ]; then
+		uci commit dhcp
+		/etc/init.d/dnsmasq restart >/dev/null 2>&1
+		sleep 1
+		log "局域网 DNS: 已为 $_n 个域名添加 dnsmasq 泛解析 -> $_lip"
+	fi
+}
+
+lan_dns_router_off() {
+	_n=0
+	for _r in $(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null); do
+		case "$_r" in
+		*/$ZONE/*) uci -q del_list "dhcp.@dnsmasq[0].address=$_r"; _n=$((_n+1)) ;;
+		esac
+	done
+	if [ "$_n" -gt 0 ]; then
+		uci commit dhcp
+		/etc/init.d/dnsmasq restart >/dev/null 2>&1
+		sleep 1
+		log "局域网 DNS 泛解析已移除"
+	fi
+	rm -f "$STATE/landns.section"
+}
+
+cmd_landns() {
+	need_root; load_global
+	sub=${1:-detect}; shift 2>/dev/null || true
+	mode=$(lan_dns_mode)
+	case "$sub" in
+	detect)
+		echo "DHCP 下发的 DNS: $(lan_dns_servers)"
+		echo "判定模式: $mode"
+		case "$mode" in
+		router) echo "→ 局域网走路由器 DNS，用泛解析 *.${ZONE} 即可，不需要 AdGuard" ;;
+		adguard) echo "→ 局域网走 AdGuard，需要逐域名重写（cfedge adguard sync）" ;;
+		external) echo "→ 局域网用公共 DNS，会解析到公网 IPv6；能否访问取决于 IPv6 回环/防火墙" ;;
+		esac
+		;;
+	router) lan_dns_router_on ;;
+	adguard) cmd_adguard sync ;;
+	off) lan_dns_router_off ;;
+	*) die "用法: cfedge landns detect|router|adguard|off" ;;
+	esac
+}
+
+
+cmd_adguard() {
+	need_root; load_global
+	sub=${1:-status}; shift 2>/dev/null || true
+	case "$sub" in
+	login)
+		url=${1:-}; user=${2:-}; pass=${3:-}
+		[ -n "$url" ] && [ -n "$user" ] || die "用法: cfedge adguard login <http://IP:3000> <用户> <密码>"
+		[ -n "$pass" ] || die "缺少密码"
+		code=$(curl -s -m 8 -o /dev/null -w '%{http_code}' -u "$user:$pass" "$url/control/status")
+		if [ "$code" = "401" ]; then
+			die "AdGuard 账号或密码不对（用户名是你初始化 AdGuard 时设置的那个，不是 admin）"
+		fi
+		[ "$code" = "200" ] || die "AdGuard 登录失败 (HTTP $code，地址应为 http://IP:3000)"
+		uci set cfedge.global.ag_url="$url"
+		uci set cfedge.global.ag_user="$user"
+		uci commit cfedge
+		printf '%s' "$pass" > "$AG_PASS_FILE"
+		chmod 600 "$AG_PASS_FILE"
+		log "AdGuard 已连接: $url"
+		cmd_adguard sync
+		;;
+	sync)
+		ag_enabled || die "还没配置 AdGuard：cfedge adguard login ..."
+		for s in $(service_names); do
+			ag_ensure "$(svc_fqdn "$s")"
+		done
+		log "AdGuard 重写已同步"
+		;;
+	off)
+		uci -q delete cfedge.global.ag_url
+		uci -q delete cfedge.global.ag_user
+		uci commit cfedge
+		rm -f "$AG_PASS_FILE"
+		log "AdGuard 集成已关闭"
+		;;
+	show)
+		if ag_enabled; then
+			printf "%s|%s|%s\n" "$(ag_url)" "$(ag_user)" "$(cat "$AG_PASS_FILE")"
+		else
+			echo "||"
+		fi ;;
+	status)
+		if ag_enabled; then
+			echo "AdGuard: $(ag_url)  user=$(ag_user)"
+			ag_api GET /control/rewrite/list | tr '}' '\n' | grep -o '"domain":"[^"]*","answer":"[^"]*"' | head -10
+		else
+			echo "AdGuard: 未配置"
+		fi
+		;;
+	*) die "未知 adguard 子命令: $sub" ;;
+	esac
+}
+
+cmd_init() {
+	need_root
+	mkdir -p "$STATE" "$CERTDIR" "$STATE/creds"
+	zone=""; token=""; edge="8443"; mode="wildcard"; email=""; prov=""; ali_key=""; ali_secret=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--zone) zone=$2; shift 2 ;;
+		--token) token=$2; shift 2 ;;
+		--edge-port) edge=$2; shift 2 ;;
+		--cert-mode) mode=$2; shift 2 ;;
+		--email) email=$2; shift 2 ;;
+		--provider) prov=$2; shift 2 ;;
+		--ali-key) ali_key=$2; shift 2 ;;
+		--ali-secret) ali_secret=$2; shift 2 ;;
+		*) die "未知参数 $1" ;;
+		esac
+	done
+	[ -n "$zone" ] || die "缺少 --zone"
+	_prev=$(g provider); [ -n "$_prev" ] || _prev=cloudflare
+	prov=${prov:-$(zone_provider "$zone")}; [ -n "$prov" ] || prov=$_prev
+	[ -f "$CFG" ] || touch "$CFG"
+	uci -q get cfedge.global >/dev/null 2>&1 || uci set cfedge.global=global
+	# 确保 zone 存在
+	if ! zone_sec "$zone" >/dev/null 2>&1; then
+		sec="z_$(echo "$zone" | tr '.' '_' | sed 's/[^a-z0-9_]/_/g')"
+		uci set "cfedge.$sec=zone"
+		uci set "cfedge.$sec.name=$zone"
+		uci set "cfedge.$sec.provider=$prov"
+	fi
+	uci set cfedge.global.zone="$zone"
+	uci set cfedge.global.default_zone="$zone"
+	uci set cfedge.global.edge_port="$edge"
+	uci set cfedge.global.cert_mode="$mode"
+	[ -n "$email" ] && uci set cfedge.global.cert_email="$email"
+	[ -n "$(g ddns_enabled)" ] || uci set cfedge.global.ddns_enabled=1
+	[ -n "$(g ddns_interval)" ] || uci set cfedge.global.ddns_interval=10
+	uci commit cfedge
+	# 凭据：同 provider 且密钥相同的复用同一 cred，否则新建
+	if [ -n "$token" ] || [ -n "$ali_key" ]; then
+		if [ -n "$ali_key" ]; then
+			_secret="$ali_key:$ali_secret"; _prov=aliyun
+		else
+			_secret="$token"; _prov=cloudflare
+		fi
+		_match=""
+		for k in $(cred_ids); do
+			[ "$(cred_provider "$k")" = "$_prov" ] || continue
+			[ "$(cat "$(cred_secret_file "$k")" 2>/dev/null | head -2 | tr '\n' ':' | sed 's/:$//')" = "$_secret" ] && { _match=$k; break; }
+		done
+		if [ -z "$_match" ]; then
+			_match=$(cmd_cred add "$_prov" "$_secret")
+		fi
+		_s=$(zone_sec "$zone"); uci set "cfedge.$_s.cred=$_match"; uci commit cfedge
+		log "域名 $zone 使用凭据 $_match"
+	fi
+	load_global
+	if ! creds_ok; then
+		log "提示: 域名 $zone 还没有可用凭据，先填 Token/AccessKey 再保存"
+		return 0
+	fi
+	if [ "$(provider)" = "aliyun" ]; then
+		ali_zone_check || die "阿里云凭据/域名校验失败"
+	else
+		cf_zone_id >/dev/null || die "Cloudflare Token 无法访问该域名"
+	fi
+	log "初始化完成: provider=$(provider_label) zone=$ZONE edge_port=$EDGE_PORT cert_mode=$CERT_MODE"
+	[ "$DDNS_ENABLED" = "1" ] && ddns_install_cron
+	ensure_cron "*/30 * * * * /usr/bin/cfedge doctor --save >/dev/null 2>&1"
+	for _s in $(service_names); do
+		_f=$(svc_fqdn "$_s")
+		_crt=$(cert_paths "$_f" | cut -d' ' -f1)
+		[ -s "$_crt" ] && render_service "$_s" >/dev/null 2>&1
+	done
+	reload_nginx >/dev/null 2>&1 || true
+	case "$EDGE_PORT" in
+	80|443) err "警告: 边缘端口 $EDGE_PORT 与 LuCI(uhttpd) 冲突，建议换 8443 等" ;;
+	esac
+}
+
+ddns_install_cron() {
+	ensure_cron "*/$DDNS_INTERVAL * * * * /usr/bin/cfedge ddns sync >/dev/null 2>&1"
+}
+
+cmd_cert() {
+	need_root; load_global
+	force=0
+	[ "${1:-}" = "--force" ] && { force=1; shift; }
+	_zone_only=${1:-}
+	if [ "$force" = 0 ]; then
+		if [ -n "${_zone_only:-}" ]; then
+			_crt0="$CERTDIR/$_zone_only.crt"
+		else
+			_crt0="$CERTDIR/$(default_zone).crt"
+			[ -s "$_crt0" ] || _crt0="$CERTDIR/wildcard.crt"
+		fi
+		if [ -s "$_crt0" ]; then
+			mt=$(stat -c %Y "$_crt0" 2>/dev/null); [ -n "$mt" ] || mt=0
+			age=$(( ( $(date +%s) - mt ) / 86400 ))
+			if openssl x509 -in "$_crt0" -checkend 2592000 >/dev/null 2>&1 && [ "$age" -lt 7 ]; then
+				log "证书仍有效（剩余超过 30 天），且距上次签发仅 ${age} 天；已跳过。强制重签: cfedge cert --force"
+				return 1
+			fi
+		fi
+	fi
+	for _z in $(zone_names_list); do
+		[ -n "$_zone_only" ] && [ "$_z" != "$_zone_only" ] && continue
+		if [ "$(zone_cert_mode "$_z")" = "wildcard" ]; then
+			cert_issue "$_z" || return 1
+		fi
+	done
+	names=""
+	for s in $(service_names); do
+		[ "$(svc_get "$s" enabled)" = "0" ] && continue
+		_z=$(zone_of_service "$s")
+		[ -n "$_zone_only" ] && [ "$_z" != "$_zone_only" ] && continue
+		[ "$(zone_cert_mode "$_z")" = "wildcard" ] && continue
+		f=$(svc_fqdn "$s")
+		case " $names " in *" $f "*) ;; *) names="$names $f" ;; esac
+	done
+	for f in $names; do cert_issue "$f" || return 1; done
+	reload_nginx
+}
+
+cmd_add() {
+	need_root; load_global
+	name=${1:-}; target=${2:-}; port=${3:-edge}
+	[ -n "$name" ] && [ -n "$target" ] || die "用法: cfedge add <名字> <内网IP:端口> [公网端口|edge] [选项]"
+	shift 2; [ $# -gt 0 ] && shift
+	lan_only=0; ws=1; large=0; scheme=http; deny_post=""; domain=""; svc_zone=""
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--lan-only) lan_only=1; shift ;;
+		--no-ws) ws=0; shift ;;
+		--large) large=1; shift ;;
+		--https-backend) scheme=https; shift ;;
+		--deny-post) deny_post=$2; shift 2 ;;
+		--domain) domain=$2; shift 2 ;;
+		--zone) svc_zone=$2; shift 2 ;;
+		*) die "未知选项 $1" ;;
+		esac
+	done
+	[ -n "$domain" ] || domain=$name
+	# 目标里带了协议就顺便设置 scheme，避免 UI 里勾选和地址不一致
+	case "$target" in
+	http://*) scheme=http; target=${target#http://} ;;
+	https://*) scheme=https; target=${target#https://} ;;
+	esac
+
+	require_ipv6
+	case "$name" in *[!a-z0-9-]*) die "名字只能用小写字母/数字/中划线" ;; esac
+	sec=$(echo "$name" | tr '-' '_')
+	[ -z "$(sec_of "$name")" ] || die "服务 $name 已存在，先 cfedge rm $name"
+
+	# 同端口 + 同域名冲突检查
+	_p=$( [ "$port" = "edge" ] && echo "$EDGE_PORT" || echo "$port" )
+	_z=$([ -n "$svc_zone" ] && echo "$svc_zone" || echo "$ZONE")
+	_fqdn="$domain.$_z"
+	for _s in $(service_names); do
+		[ "$(svc_port "$_s")" = "$_p" ] || continue
+		[ "$(svc_fqdn "$_s")" = "$_fqdn" ] && die "端口 $_p + 域名 $_fqdn 已被服务 $_s 占用，换端口可用: cfedge port suggest $_p"
+	done
+	if [ "$_p" = "80" ] || [ "$_p" = "443" ]; then
+		die "端口 $_p 与 LuCI(uhttpd) 冲突，可用: cfedge port suggest 8443"
+	fi
+
+	uci set "cfedge.$sec=service"
+	uci set "cfedge.$sec.domain=$domain"
+	[ -n "$svc_zone" ] && uci set "cfedge.$sec.zone=$svc_zone"
+	uci set "cfedge.$sec.target=$target"
+	uci set "cfedge.$sec.port=$port"
+	uci set "cfedge.$sec.scheme=$scheme"
+	uci set "cfedge.$sec.lan_only=$lan_only"
+	uci set "cfedge.$sec.ws=$ws"
+	uci set "cfedge.$sec.large=$large"
+	uci set "cfedge.$sec.deny_post=$deny_post"
+	uci set "cfedge.$sec.enabled=1"
+	uci commit cfedge
+
+	service_apply "$sec" || { err "应用失败，回滚"; cmd_rm "$name" >/dev/null 2>&1; return 1; }
+	log "服务已添加: https://$(svc_fqdn "$sec"):$(svc_port "$sec")"
+}
+
+cmd_rm() {
+	need_root; load_global
+	name=${1:-}; [ -n "$name" ] || die "用法: cfedge rm <名字>"
+	sec=$(sec_of "$name" 2>/dev/null) || true
+	[ -n "$sec" ] || { log "服务 $name 不存在"; return 0; }
+	fqdn=$(svc_fqdn "$sec")
+	rm -f "/etc/nginx/conf.d/cfedge-$sec.conf"
+	uci -q delete "cfedge.$sec"
+	uci commit cfedge
+	reload_nginx >/dev/null 2>&1
+	fw_remove_unused
+	# 只有没有别的服务再用这个域名时才删 DNS
+	used=0
+	for s in $(service_names); do
+		[ "$(svc_fqdn "$s")" = "$fqdn" ] && used=1
+	done
+	if [ "$used" = "0" ]; then
+		dns_delete "$fqdn" >/dev/null 2>&1
+		ag_delete "$fqdn"
+	fi
+	log "服务已删除: $name"
+}
+
+cmd_list() {
+	load_global
+	printf '%-16s %-26s %-40s %-6s %-24s %s\n' NAME ZONE URL PORT TARGET FLAGS
+	for s in $(service_names); do
+		flags=""
+		[ "$(svc_get "$s" lan_only)" = "1" ] && flags="$flags lan-only"
+		[ "$(svc_get "$s" enabled)" = "0" ] && flags="$flags disabled"
+		printf '%-16s %-26s %-40s %-6s %-24s %s\n' "$s" "$(zone_of_service "$s")" \
+			"https://$(svc_fqdn "$s"):$(svc_port "$s")" "$(svc_port "$s")" "$(svc_backend "$s")" "$flags"
+	done
+}
+
+cmd_check() {
+	t=${1:-}
+	[ -n "$t" ] || die "用法: cfedge check http://192.168.1.10:8080"
+	case "$t" in
+	http://*|https://*) url=$t ;;
+	*) url="http://$t" ;;
+	esac
+	code=$(curl -s -k -o /dev/null -m 6 -w '%{http_code}' "$url" 2>/dev/null)
+	if [ -z "$code" ] || [ "$code" = "000" ]; then
+		echo "不可达（$url）"
+		return 1
+	fi
+	echo "可达 HTTP $code（$url）"
+	return 0
+}
+
+cmd_cred() {
+	need_root; load_global
+	sub=${1:-list}; shift 2>/dev/null || true
+	case "$sub" in
+	list)
+		printf '%-10s %-12s %-24s %s\n' ID PROVIDER MASKED ZONES
+		for k in $(cred_ids); do
+			printf '%-10s %-12s %-24s %s\n' "$k" "$(cred_provider "$k")" "$(cred_masked "$k")" "$(cred_zones "$k" | tr '\n' ' ')"
+		done ;;
+	add)
+		prov=${1:-cloudflare}; secret=${2:-}
+		[ -n "$secret" ] || die "用法: cfedge cred add <cloudflare|aliyun> <密钥>（阿里云写成 AK:SK）"
+		k="cred$(( $(cred_ids | wc -l) + 1 ))"
+		while [ -e "$(cred_secret_file "$k")" ]; do k="${k}x"; done
+		mkdir -p "$STATE/creds"
+		if [ "$prov" = "aliyun" ]; then
+			printf "%s\n" "$secret" | tr ':' '\n' > "$STATE/creds/$k"
+		else
+			printf "%s\n" "$secret" > "$STATE/creds/$k"
+		fi
+		chmod 600 "$STATE/creds/$k"
+		uci set "cfedge.$k=cred"
+		uci set "cfedge.$k.provider=$prov"
+		uci set "cfedge.$k.label=$prov"
+		uci commit cfedge
+		echo "$k" ;;
+	show) k=${1:-}; [ -r "$(cred_secret_file "$k")" ] || die "凭据不存在: $k"; cat "$(cred_secret_file "$k")" ;;
+	tokens)
+		p=${1:-cloudflare}
+		for k in $(cred_ids); do
+			[ "$(cred_provider "$k")" = "$p" ] || continue
+			tr '\n' '|' < "$(cred_secret_file "$k")" 2>/dev/null | sed 's/|$//'; echo
+		done ;;
+	rm)
+		k=${1:-}; n=$(cred_zones "$k" | wc -l); [ "$n" -gt 0 ] && die "还有 $n 个域名在用这个凭据"
+		uci -q delete "cfedge.$k"; uci commit cfedge; rm -f "$(cred_secret_file "$k")"
+		log "凭据已删除: $k" ;;
+	*) die "用法: cfedge cred list|add|show|rm" ;;
+	esac
+}
+
+cmd_port() {
+	sub=${1:-suggest}; p=${2:-${EDGE_PORT:-8443}}
+	case "$sub" in
+	suggest)
+		while netstat -ltn 2>/dev/null | grep -q ":$p " || uci -q get "firewall.cfedge_$p" >/dev/null 2>&1; do
+			p=$((p+1)); [ "$p" -gt 65000 ] && break
+		done
+		echo "$p" ;;
+	*) die "用法: cfedge port suggest [起始端口]" ;;
+	esac
+}
+
+cmd_zone() {
+	need_root; load_global
+	sub=${1:-list}; shift 2>/dev/null || true
+	case "$sub" in
+	list)
+		printf '%-26s %-12s %-10s %-10s %s\n' ZONE PROVIDER CERT CRED SERVICES
+		for z in $(zone_names_list); do
+			n=0; for s in $(service_names); do [ "$(zone_of_service "$s")" = "$z" ] && n=$((n+1)); done
+			printf '%-26s %-12s %-10s %-10s %s\n' "$z" "$(zone_provider "$z")" "$(zone_cert_mode "$z")" "$(zone_cred "$z")" "$n"
+		done ;;
+	add)
+		name=${1:-}; [ -n "$name" ] || die "用法: cfedge zone add <域名> --provider X [--token T | --ali-key AK --ali-secret SK]"
+		shift 2>/dev/null || true
+		prov=""; _tok=""; _ak=""; _sk=""
+		while [ $# -gt 0 ]; do
+			case "$1" in
+			--provider) prov=$2; shift 2 ;;
+			--token) _tok=$2; shift 2 ;;
+			--ali-key) _ak=$2; shift 2 ;;
+			--ali-secret) _sk=$2; shift 2 ;;
+			--cred) _cred=$2; shift 2 ;;
+			*) shift ;;
+			esac
+		done
+		prov=${prov:-cloudflare}
+		zone_sec "$name" >/dev/null 2>&1 && die "已存在: $name"
+		sec="z_$(echo "$name" | tr '.' '_' | sed 's/[^a-z0-9_]/_/g')"
+		cred="${_cred:-}"
+		if [ -z "$cred" ]; then
+			if [ "$prov" = "aliyun" ]; then
+				[ -n "$_ak" ] && [ -n "$_sk" ] || die "阿里云需要 AccessKey ID 和 Secret"
+				cred=$(cmd_cred add aliyun "$_ak:$_sk" | tail -1)
+			else
+				[ -n "$_tok" ] || die "Cloudflare 需要 API Token"
+				cred=$(cmd_cred add cloudflare "$_tok" | tail -1)
+			fi
+		fi
+		uci set "cfedge.$sec=zone"
+		uci set "cfedge.$sec.name=$name"
+		uci set "cfedge.$sec.provider=$prov"
+		uci set "cfedge.$sec.cred=$cred"
+		uci commit cfedge
+		# 校验：该凭据能否管理这个域名
+		ZONE_CTX=$name; _ok=0
+		if [ "$prov" = "aliyun" ]; then ali_zone_check >/dev/null 2>&1 && _ok=1; else cf_zone_id >/dev/null 2>&1 && _ok=1; fi
+		ZONE_CTX=""
+		if [ "$_ok" != "1" ]; then
+			uci -q delete "cfedge.$sec"; uci commit cfedge
+			[ -z "${_cred:-}" ] && { uci -q delete "cfedge.$cred"; uci commit cfedge; rm -f "$(cred_secret_file "$cred")"; }
+			die "凭据无法管理 $name（检查 Token 权限 / 域名是否托管在 $prov）"
+		fi
+		uci set cfedge.global.default_zone="$name"; uci commit cfedge
+		log "域名已添加: $name（provider=$prov, cred=$cred, 已设为默认）" ;;
+	set-cert-mode)
+		name=${1:-}; mode=${2:-}; zone_sec "$name" >/dev/null 2>&1 || die "域名不存在: $name"
+		case "$mode" in wildcard|per-domain) ;; *) die "模式只能是 wildcard 或 per-domain" ;; esac
+		_s=$(zone_sec "$name"); uci set "cfedge.$_s.cert_mode=$mode"; uci commit cfedge
+		log "$name 证书模式已设为 $mode" ;;
+
+	set-cred)
+		name=${1:-}; cred=${2:-}; zone_sec "$name" >/dev/null 2>&1 || die "域名不存在: $name"
+		uci -q get "cfedge.$cred" >/dev/null 2>&1 || die "凭据不存在: $cred"
+		_s=$(zone_sec "$name"); uci set "cfedge.$_s.cred=$cred"; uci commit cfedge
+		log "已把 $name 绑定到凭据 $cred" ;;
+	rm)
+		name=${1:-}
+		_purge=0
+		for a in "$@"; do [ "$a" = "--purge" ] && _purge=1; done
+		sec=$(zone_sec "$name" 2>/dev/null) || die "不存在: $name"
+		if [ "$_purge" = "1" ]; then
+			for s in $(service_names); do
+				[ "$(zone_of_service "$s")" = "$name" ] && cmd_rm "$s" >/dev/null 2>&1
+			done
+		fi
+		n=0; for s in $(service_names); do [ "$(zone_of_service "$s")" = "$name" ] && n=$((n+1)); done
+		[ "$n" -gt 0 ] && die "还有 $n 个服务使用 $name，先删除这些服务（或用 --purge）"
+		# 清理该域名的局域网解析与缓存
+		for _r in $(uci -q get dhcp.@dnsmasq[0].address 2>/dev/null); do
+			case "$_r" in */"$name"/*) uci -q del_list "dhcp.@dnsmasq[0].address=$_r" ;; esac
+		done
+		uci commit dhcp 2>/dev/null || true
+	ag_delete "*.$name" 2>/dev/null || true
+	rm -f "$STATE/zones/$name.id"
+
+		_cred=$(uci -q get "cfedge.$sec.cred")
+		uci -q delete "cfedge.$sec"; uci commit cfedge
+		[ "$(g default_zone)" = "$name" ] && { uci set cfedge.global.default_zone="$(zone_names_list | head -1)"; uci commit cfedge; }
+		rm -f "$CERTDIR/$name.crt" "$CERTDIR/$name.key"
+		if [ -n "$_cred" ]; then
+			if [ -z "$(cred_zones "$_cred")" ]; then
+				uci -q delete "cfedge.$_cred"; uci commit cfedge; rm -f "$(cred_secret_file "$_cred")"
+				log "域名已删除: $name（凭据 $_cred 只属于它，一并删除）"
+			else
+				log "域名已删除: $name（凭据 $_cred 仍被其他域名使用，保留）"
+			fi
+		else
+			log "域名已删除: $name"
+		fi ;;
+	set-default)
+		name=${1:-}; zone_sec "$name" >/dev/null 2>&1 || die "不存在: $name"
+		uci set cfedge.global.default_zone="$name"; uci commit cfedge
+		log "默认域名已设为: $name" ;;
+	info)
+		name=${1:-$(default_zone)}
+		_cr="$CERTDIR/$name.crt"; _na=""; _ci=true
+		if [ -s "$_cr" ]; then
+			_na=$(openssl x509 -in "$_cr" -noout -enddate 2>/dev/null | cut -d= -f2)
+			if openssl x509 -in "$_cr" -checkend 2592000 >/dev/null 2>&1; then _ci=false; else _ci=true; fi
+		fi
+		printf "%s|%s|%s|%s|%s|%s|%s\n" "$name" "$(zone_provider "$name")" "$(zone_cred "$name")" "$(cred_masked "$(zone_cred "$name")")" "$(zone_cert_mode "$name")" "$_na" "$_ci" ;;
+	*) die "用法: cfedge zone list|add|rm|set-default|set-cred|info" ;;
+	esac
+}
+cmd_provider() {
+	need_root; load_global
+	sub=${1:-show}; shift 2>/dev/null || true
+	case "$sub" in
+	show) echo "$(provider)" ;;
+	creds)
+		printf "%s|%s|%s\n" "$(cat "$TOKEN_FILE" 2>/dev/null)" \
+			"$(cat "$ALI_ID_FILE" 2>/dev/null)" "$(cat "$ALI_SECRET_FILE" 2>/dev/null)" ;;
+	test)
+		if [ "$(provider)" = "aliyun" ]; then
+			ali_zone_check && log "阿里云 DNS 连接正常"
+		else
+			cf_zone_id >/dev/null && log "Cloudflare 连接正常"
+		fi ;;
+	*) die "用法: cfedge provider show|creds|test" ;;
+	esac
+}
+
+cmd_token() {
+	need_root; load_global
+	sub=${1:-show}; shift 2>/dev/null || true
+	case "$sub" in
+	show) [ -r "$TOKEN_FILE" ] && cat "$TOKEN_FILE" || true ;;
+	set)
+		[ -n "${1:-}" ] || die "用法: cfedge token set <token>"
+		printf "%s" "$1" > "$TOKEN_FILE"
+		chmod 600 "$TOKEN_FILE"
+		log "API Token 已更新" ;;
+	*) die "用法: cfedge token show|set <token>" ;;
+	esac
+}
+
+cmd_reload() { need_root; load_global; reload_nginx; }
+
+cmd_set() {
+	need_root; load_global
+	name=${1:-}
+	[ -n "$name" ] || die "用法: cfedge set <名字> [--port X] [--target IP:端口] [--lan-only 0|1] [--large 0|1] [--ws 0|1] [--deny-post '/路径']"
+	sec=$(sec_of "$name" 2>/dev/null) || true
+	[ -n "$sec" ] || die "服务 $name 不存在"
+	shift
+	[ $# -gt 0 ] || die "没有要修改的选项"
+	while [ $# -gt 0 ]; do
+		case "$1" in
+		--port) uci set "cfedge.$sec.port=$2"; shift 2 ;;
+		--target)
+			t=$2
+			case "$t" in
+			http://*) uci set "cfedge.$sec.scheme=http"; t=${t#http://} ;;
+			https://*) uci set "cfedge.$sec.scheme=https"; t=${t#https://} ;;
+			esac
+			uci set "cfedge.$sec.target=$t"; shift 2 ;;
+		--domain) uci set "cfedge.$sec.domain=$2"; shift 2 ;;
+		--scheme) uci set "cfedge.$sec.scheme=$2"; shift 2 ;;
+		--lan-only) uci set "cfedge.$sec.lan_only=$2"; shift 2 ;;
+		--large) uci set "cfedge.$sec.large=$2"; shift 2 ;;
+		--ws) uci set "cfedge.$sec.ws=$2"; shift 2 ;;
+		--deny-post) uci set "cfedge.$sec.deny_post=$2"; shift 2 ;;
+		--enabled) uci set "cfedge.$sec.enabled=$2"; shift 2 ;;
+		*) die "未知参数 $1" ;;
+		esac
+	done
+	uci commit cfedge
+	service_apply "$sec" || return 1
+	log "服务已更新: $name"
+}
+
+cmd_ddns() {
+	need_root; load_global
+	sub=${1:-status}; shift 2>/dev/null || true
+	case "$sub" in
+	sync)
+		require_ipv6
+		ip=$(ipv6_public) || die "拿不到 WAN IPv6"
+		echo "$ip" > "$IPFILE"
+		for s in $(service_names); do
+			[ "$(svc_get "$s" enabled)" = "0" ] && continue
+			f=$(svc_fqdn "$s")
+			dns_ensure "$f" "$ip" || err "同步失败: $f"
+		done
+		for f in $(uci -q get cfedge.global.ddns_extra 2>/dev/null); do
+			dns_ensure "$f" "$ip" || err "同步失败: $f"
+		done
+		log "DDNS 同步完成: $ip"
+		;;
+	status)
+		ip=$(ipv6_addr)
+		last=$(cat "$IPFILE" 2>/dev/null)
+		echo "WAN IPv6   : ${ip:-未知}"
+		echo "上次同步 IP : ${last:-从未}"
+		echo "同步间隔   : ${DDNS_INTERVAL} 分钟"
+		grep -q 'cfedge ddns sync' /etc/crontabs/root 2>/dev/null && echo "定时任务   : 已启用" || echo "定时任务   : 未启用"
+		echo "维护域名   :"
+		for s in $(service_names); do echo "  - $(svc_fqdn "$s") (服务 $s)"; done
+		for f in $(uci -q get cfedge.global.ddns_extra 2>/dev/null); do echo "  - $f (额外)"; done
+		;;
+	enable)
+		uci set cfedge.global.ddns_enabled=1; uci commit cfedge
+		ddns_install_cron
+		log "DDNS 已启用 (每 ${DDNS_INTERVAL} 分钟)"
+		;;
+	interval)
+		v=${1:-}
+		case "$v" in ''|*[!0-9]*) die "用法: cfedge ddns interval <分钟数>" ;; esac
+		uci set cfedge.global.ddns_interval="$v"; uci commit cfedge
+		DDNS_INTERVAL=$v
+		drop_cron 'cfedge ddns sync'
+		[ "$DDNS_ENABLED" = "1" ] && ddns_install_cron
+	# 证书模式/域名变化后重建 vhost（仅在证书就绪时，避免 nginx -t 失败）
+	for _s in $(service_names); do
+		_f=$(svc_fqdn "$_s")
+		_crt=$(cert_paths "$_f" | cut -d' ' -f1)
+		[ -s "$_crt" ] && render_service "$_s" >/dev/null 2>&1
+	done
+	reload_nginx >/dev/null 2>&1 || true
+	ensure_cron "*/30 * * * * /usr/bin/cfedge doctor --save >/dev/null 2>&1"
+		log "DDNS 间隔已改为 $v 分钟"
+		;;
+	disable)
+		uci set cfedge.global.ddns_enabled=0; uci commit cfedge
+		drop_cron 'cfedge ddns sync'
+		log "DDNS 已停用"
+		;;
+	add)
+		f=${1:-}; [ -n "$f" ] || die "用法: cfedge ddns add <域名>"
+		uci add_list cfedge.global.ddns_extra="$f" 2>/dev/null || uci set cfedge.global.ddns_extra="$f"
+		uci commit cfedge
+		log "额外域名已加入: $f"
+		;;
+	rm)
+		f=${1:-}
+		uci -q del_list cfedge.global.ddns_extra="$f" 2>/dev/null
+		uci commit cfedge
+		log "额外域名已移除: $f"
+		;;
+	set-extra)
+		list=${1:-}
+		uci -q delete cfedge.global.ddns_extra 2>/dev/null
+		old_ifs=$IFS
+		IFS=','
+		for f in $list; do
+			# 去掉空白
+			f=$(echo "$f" | tr -d ' \t')
+			[ -n "$f" ] && uci add_list cfedge.global.ddns_extra="$f"
+		done
+		IFS=$old_ifs
+		uci commit cfedge
+		log "额外域名列表已更新: $list"
+		;;
+	*) die "未知 ddns 子命令: $sub" ;;
+	esac
+}
+
+cmd_status() {
+	load_global
+	json=0
+	[ "${1:-}" = "--json" ] && json=1
+	ip=$(ipv6_public); last=$(cat "$IPFILE" 2>/dev/null)
+	cron_on=0; grep -q 'cfedge ddns sync' /etc/crontabs/root 2>/dev/null && cron_on=1
+	doc=$(cat "$STATE/doctor.json" 2>/dev/null)
+	[ -n "$doc" ] || doc=null
+	# 证书状态（供 UI 判断能否签发）
+	crt=""
+	[ "$CERT_MODE" = "wildcard" ] && crt="$CERTDIR/wildcard.crt"
+	certjson=null
+	if [ -n "$crt" ] && [ -s "$crt" ]; then
+		na=$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null | cut -d= -f2)
+		mt=$(stat -c %Y "$crt" 2>/dev/null); [ -n "$mt" ] || mt=0
+		age=$(( ( $(date +%s) - mt ) / 86400 ))
+		if openssl x509 -in "$crt" -checkend 2592000 >/dev/null 2>&1; then ci=false; else ci=true; fi
+		[ "$ci" = "true" ] && [ "$age" -lt 7 ] && ci=false
+		certjson="{\"not_after\":\"$na\",\"can_issue\":$ci,\"age_days\":$age}"
+	fi
+	agflag=false
+	ag_enabled && agflag=true
+	has_token=false
+	creds_ok && has_token=true
+	zjson=""
+	for _z in $(zone_names_list); do
+		_nz=0; for s in $(service_names); do [ "$(zone_of_service "$s")" = "$_z" ] && _nz=$((_nz+1)); done
+		[ -n "$zjson" ] && zjson="$zjson,"
+		_names=""; for s in $(service_names); do [ "$(zone_of_service "$s")" = "$_z" ] && _names="$_names$s,"; done
+_names=$(echo "$_names" | sed "s/,$//")
+_cr="$CERTDIR/$_z.crt"; _na=""; _ci=true
+if [ -s "$_cr" ]; then _na=$(openssl x509 -in "$_cr" -noout -enddate 2>/dev/null | cut -d= -f2); if openssl x509 -in "$_cr" -checkend 2592000 >/dev/null 2>&1; then _ci=false; else _ci=true; fi; fi
+zjson="$zjson{\"name\":\"$_z\",\"provider\":\"$(zone_provider "$_z")\",\"cred\":\"$(zone_cred "$_z")\",\"masked\":\"$(cred_masked "$(zone_cred "$_z")")\",\"cert_mode\":\"$(zone_cert_mode "$_z")\",\"not_after\":\"$_na\",\"can_issue\":$_ci,\"services\":$_nz,\"svc_names\":\"$_names\"}"
+	done
+	cjson=""
+	for _k in $(cred_ids); do
+		[ -n "$cjson" ] && cjson="$cjson,"
+		cjson="$cjson{\"id\":\"$_k\",\"provider\":\"$(cred_provider "$_k")\",\"masked\":\"$(cred_masked "$_k")\",\"zones\":\"$(cred_zones "$_k" | tr '\n' ',' | sed 's/,$//')\"}"
+	done
+	agurl=$(ag_url)
+
+	if [ "$json" = "1" ]; then
+		extra=$(uci -q get cfedge.global.ddns_extra 2>/dev/null | tr '\n' ',' | sed 's/,$//')
+		printf '{"version":"%s","provider":"%s","provider_label":"%s","zone":"%s","edge_port":"%s","cert_mode":"%s","ipv6":"%s","ipv6_ok":%s,"ipv6_reason":"%s","last_ip":"%s","ddns_enabled":%s,"ddns_interval":"%s","extra":"%s","doctor":%s,"cert":%s,"adguard":%s,"ag_url":"%s","lan_ip":"%s","landns":"%s","has_token":%s,"creds":[%s],"zones":[%s],"services":[' \
+			"$VERSION" "$(provider)" "$(provider_label)" "$ZONE" "$EDGE_PORT" "$CERT_MODE" "$ip" "$([ "$(ipv6_status)" = ok ] && echo true || echo false)" "$(ipv6_status)" "$last" \
+			"$([ "$DDNS_ENABLED" = 1 ] && echo true || echo false)" "$DDNS_INTERVAL" "$extra" "$doc" "$certjson" "$agflag" "$agurl" "$(lan_ip)" "$(lan_dns_mode)" "$has_token" "$cjson" "$zjson"
+		first=1
+		for s in $(service_names); do
+			[ "$first" = "1" ] || printf ','
+			first=0
+			printf '{"name":"%s","fqdn":"%s","port":"%s","target":"%s","lan_only":%s,"large":%s,"ws":%s,"enabled":%s}' \
+				"$s" "$(svc_fqdn "$s")" "$(svc_port "$s")" "$(svc_backend "$s")" \
+				"$([ "$(svc_get "$s" lan_only)" = 1 ] && echo true || echo false)" \
+				"$([ "$(svc_get "$s" large)" = 1 ] && echo true || echo false)" \
+				"$([ "$(svc_get "$s" ws)" = "0" ] && echo false || echo true)" \
+				"$([ "$(svc_get "$s" enabled)" = "0" ] && echo false || echo true)"
+		done
+		printf ']}\n'
+		return 0
+	fi
+	echo "cfedge $VERSION  zone=$ZONE  edge_port=$EDGE_PORT  cert=$CERT_MODE"
+	echo "WAN IPv6: ${ip:-未知}  上次同步: ${last:-从未}  DDNS: $([ "$cron_on" = 1 ] && echo 启用 || echo 停用)"
+	cmd_list
+}
+
+cmd_doctor() {
+	need_root; load_global
+	mode=human; save=0
+	for a in "$@"; do
+		case "$a" in
+		--json) mode=json ;;
+		--save) save=1 ;;
+		esac
+	done
+	items=/tmp/cfedge.doctor.$$
+	grep -q 'cfedge doctor --save' /etc/crontabs/root 2>/dev/null || ensure_cron "*/30 * * * * /usr/bin/cfedge doctor --save >/dev/null 2>&1"
+	: > "$items"
+	ok=0; warn=0; bad=0
+	chk_ok()   { echo "ok|$*"   >> "$items"; ok=$((ok+1)); }
+	chk_warn() { echo "warn|$*" >> "$items"; warn=$((warn+1)); }
+	chk_bad()  { echo "fail|$*" >> "$items"; bad=$((bad+1)); }
+	chk_hdr()  { echo "h|$*"    >> "$items"; }
+
+	chk_hdr "基础"
+	[ "$(id -u)" = 0 ] && chk_ok "root 权限" || chk_bad "需要 root"
+	if creds_ok; then chk_ok "$(provider_label) 凭据已配置"; else chk_bad "$(provider_label) 凭据缺失"; fi
+	if zone_id >/dev/null 2>&1; then chk_ok "Cloudflare zone 可访问 ($ZONE)"; else chk_bad "Cloudflare API 访问失败"; fi
+	ip=$(ipv6_public)
+	ula=$(ipv6_ula)
+	case "$(ipv6_status)" in
+	ok)
+		chk_ok "公网 IPv6: $ip"
+		ipv6_ping_ok && chk_ok "IPv6 出站连通（ping 2400:3200::1）" || chk_warn "有地址但 ping 不通外网：检查光猫 IPv6 防火墙/运营商" ;;
+
+	no-addr)
+		if [ -n "$ula" ]; then
+			chk_bad "只有 ULA 内网地址（$ula），没有公网 IPv6：上游未下发前缀"
+		else
+			chk_bad "没有公网 IPv6 地址：光猫/运营商未下发，或 WAN6 未启用"
+		fi
+		chk_ok "提示：光猫需开启 IPv6 并下发 /64 前缀；iStoreOS 的 wan6 用 DHCPv6/SLAAC" ;;
+
+	no-route)
+		chk_bad "有 IPv6 地址但缺默认路由：WAN6/DHCPv6 客户端异常" ;;
+
+	esac
+	if uci -q get network.wan6 >/dev/null 2>&1; then chk_ok "wan6 接口已配置"; else chk_warn "未发现 wan6 接口（IPv6 可能没启用）"; fi
+	pidof odhcp6c >/dev/null 2>&1 && chk_ok "DHCPv6 客户端在运行" || chk_warn "没有 dhcpv6 客户端在跑"
+
+	chk_hdr "端口"
+	case "$EDGE_PORT" in
+	80|443) chk_bad "边缘端口 $EDGE_PORT 与 LuCI(uhttpd) 冲突，换一个（建议 8443）" ;;
+	*) chk_ok "边缘端口 $EDGE_PORT 不冲突" ;;
+	esac
+	ports=""
+	for s in $(service_names); do
+		[ "$(svc_get "$s" enabled)" = "0" ] && continue
+		p=$(svc_port "$s")
+		case " $ports " in *" $p "*) ;; *) ports="$ports $p" ;; esac
+	done
+	if [ -n "$ports" ]; then
+		for p in $ports; do
+			if netstat -ltn 2>/dev/null | grep -q ":$p "; then
+				chk_ok "nginx 监听 $p"
+			else
+				chk_bad "没有进程监听 $p"
+			fi
+		done
+	else
+		chk_warn "还没有服务，跳过端口检查"
+	fi
+
+	chk_hdr "证书"
+	for _z in $(zone_names_list); do
+		_crt="$CERTDIR/$_z.crt"
+		if [ "$(zone_cert_mode "$_z")" = "wildcard" ]; then
+			if [ -s "$_crt" ]; then
+				_end=$(openssl x509 -in "$_crt" -noout -enddate 2>/dev/null | cut -d= -f2)
+				chk_ok "通配符证书 $_z（到期 $_end）"
+			else
+				chk_warn "缺少通配符证书 $_z：cfedge cert"
+			fi
+		else
+			chk_ok "逐域名证书模式: $_z"
+		fi
+	done
+
+	chk_hdr "服务"
+	for s in $(service_names); do
+		f=$(svc_fqdn "$s"); p=$(svc_port "$s")
+		if cert_covered "$f"; then chk_ok "$s: 证书覆盖 $f"; else chk_bad "$s: 证书不覆盖 $f"; fi
+		if [ "$(svc_get "$s" lan_only)" != "1" ]; then
+			uci -q get "firewall.cfedge_$p" >/dev/null 2>&1 && chk_ok "$s: 防火墙已放行 tcp/$p" || chk_bad "$s: 缺少防火墙规则 tcp/$p"
+		else
+			chk_ok "$s: 仅内网（无需防火墙）"
+		fi
+		if [ -n "$ip" ]; then
+			got=$(curl -s -m 15 "$DOH?name=$f&type=AAAA" -H 'accept: application/dns-json' 2>/dev/null |
+				grep -o '"data":"[0-9a-f:]*"' | head -1 | cut -d'"' -f4)
+			[ "$got" = "$ip" ] && chk_ok "$s: DNS AAAA 正确" || chk_warn "$s: DNS AAAA=$got，当前=$ip"
+		fi
+	done
+
+	chk_hdr "定时任务"
+	grep -q 'cfedge ddns sync' /etc/crontabs/root 2>/dev/null && chk_ok "DDNS 定时任务" || chk_warn "DDNS 定时任务缺失"
+	grep -q 'acme.sh --cron' /etc/crontabs/root 2>/dev/null && chk_ok "证书续期任务" || chk_warn "证书续期任务缺失"
+	grep -q 'cfedge doctor --save' /etc/crontabs/root 2>/dev/null && chk_ok "自检定时任务" || chk_warn "自检定时任务缺失（cfedge doctor 会补上）"
+
+	chk_hdr "局域网 DNS"
+	case "$(lan_dns_mode)" in
+	router)
+		if uci -q get dhcp.@dnsmasq[0].address 2>/dev/null | grep -q "/$ZONE/"; then
+			chk_ok "路由器 DNS 模式，泛解析 *.$ZONE 已配置"
+		else
+			chk_warn "路由器 DNS 模式但缺泛解析：cfedge landns router"
+		fi ;;
+	adguard) chk_ok "局域网 DNS 由 AdGuard 接管（逐域名重写）" ;;
+	external) chk_warn "局域网 DNS 不由路由器提供（AdGuard/Pi-hole/公共 DNS）：需在它上面加解析，否则内网域名走公网 IPv6" ;;
+	esac
+
+	chk_hdr "外部提示"
+	chk_ok "光猫 IPv6 防火墙需关闭/放行"
+	chk_ok "公网端口避开 80/443"
+	chk_ok "凭据最小权限（Cloudflare Zone:Read+DNS:Edit / 阿里云 RAM 仅 DNS 权限）"
+
+	# 组装 JSON
+	ts=$(date '+%F %T')
+	json="{\"time\":\"$ts\",\"ok\":$ok,\"warn\":$warn,\"fail\":$bad,\"items\":["
+	first=1
+	while IFS='|' read -r lvl txt; do
+		[ "$lvl" = "h" ] && continue
+		[ -z "$lvl" ] && continue
+		esc=$(printf '%s' "$txt" | sed 's/\\/\\\\/g; s/"/\\"/g')
+		[ "$first" = 1 ] || json="$json,"
+		first=0
+		json="$json{\"l\":\"$lvl\",\"t\":\"$esc\"}"
+	done < "$items"
+	json="$json]}"
+
+	[ "$save" = 1 ] && printf '%s\n' "$json" > "$STATE/doctor.json"
+
+	if [ "$mode" = "json" ]; then
+		printf '%s\n' "$json"
+	else
+		echo "== 自检 $ts =="
+		while IFS='|' read -r lvl txt; do
+			case "$lvl" in
+			h) echo "-- $txt --" ;;
+			ok) echo "  [OK]   $txt" ;;
+			warn) echo "  [WARN] $txt" ;;
+			fail) echo "  [FAIL] $txt" ;;
+			esac
+		done < "$items"
+		echo
+		echo "结果: OK=$ok WARN=$warn FAIL=$bad"
+	fi
+	rm -f "$items"
+	[ "$save" = 1 ] && return 0
+	[ "$bad" -eq 0 ]
+}
+
+usage() {
+	cat <<'EOF'
+cfedge <命令> [参数]
+
+  init --zone <域名> --token <CF_TOKEN> [--edge-port 8443] [--cert-mode wildcard|per-domain]
+  init --zone <域名> --provider aliyun --ali-key <AK> --ali-secret <SK> [...]
+  doctor
+  cert [--force]
+  add <名字> <内网IP:端口> [公网端口|edge] [--lan-only] [--no-ws] [--large] [--https-backend] [--deny-post '/路径'] [--domain 子域]
+  set <名字> [--port X] [--target IP:端口] [--lan-only 0|1] [--large 0|1] [--ws 0|1] [--deny-post '/路径'] [--enabled 0|1]
+  rm <名字>
+  list
+  ddns sync|status|enable|disable|interval <分钟>|add <域名>|rm <域名>|set-extra <逗号列表>
+  status [--json]
+  adguard login <http://IP:3000> <用户> <密码> | sync | off | status
+  landns detect | router | adguard | off   局域网 DNS 模式
+  token show | set <token>                查看/更新 API Token
+  provider show | creds | test            当前 DNS 提供商 / 凭据 / 连通性
+  check <http://IP:端口>   探测内网服务是否可达
+  reload
+EOF
+}
+
+cmd=${1:-}; shift 2>/dev/null || true
+case "$cmd" in
+init) cmd_init "$@" ;;
+doctor) cmd_doctor "$@" ;;
+cert) cmd_cert "$@" ;;
+add) cmd_add "$@" ;;
+rm) cmd_rm "$@" ;;
+set) cmd_set "$@" ;;
+list) cmd_list ;;
+ddns) cmd_ddns "$@" ;;
+status) cmd_status "$@" ;;
+reload) cmd_reload ;;
+check) cmd_check "$@" ;;
+adguard) cmd_adguard "$@" ;;
+landns) cmd_landns "$@" ;;
+token) cmd_token "$@" ;;
+provider) cmd_provider "$@" ;;
+zone) cmd_zone "$@" ;;
+cred) cmd_cred "$@" ;;
+port) cmd_port "$@" ;;
+""|-h|--help|help) usage ;;
+*) usage; exit 1 ;;
+esac

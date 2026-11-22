@@ -1,0 +1,13 @@
+{
+	"admin/services/cfedge": {
+		"title": "Cloudflare 边缘",
+		"order": 61,
+		"action": {
+			"type": "view",
+			"path": "cfedge/main"
+		},
+		"depends": {
+			"acl": [ "luci-app-cfedge" ]
+		}
+	}
+}
