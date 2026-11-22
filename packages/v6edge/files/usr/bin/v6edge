@@ -681,6 +681,12 @@ render_service() { # render_service NAME
 	hsts=$(svc_get "$name" hsts); hsts=${hsts:-1}
 	deny_post=$(svc_get "$name" deny_post)
 	proxy_host=$(svc_get "$name" proxy_host)
+	proxy_origin=$(svc_get "$name" proxy_origin)
+	if [ "$proxy_origin" = "target" ]; then
+		_bs=${backend%%://*}
+		_bh=$(printf "%s" "$backend" | sed 's#^[a-z]*://##; s#/.*$##')
+		proxy_origin="${_bs}://${_bh}"
+	fi
 	if [ "$proxy_host" = "target" ]; then proxy_host=$(printf "%s" "$backend" | sed 's#^[a-z]*://##; s#/.*$##'); fi
 	paths=$(cert_paths "$fqdn"); crt=${paths%% *}; key=${paths#* }
 	out="/etc/nginx/conf.d/v6edge-$name.conf"
@@ -722,7 +728,13 @@ render_service() { # render_service NAME
 				echo "        if (\$request_method = POST) { return 403; }"
 				echo "        proxy_pass $backend;"
 				echo "        proxy_http_version 1.1;"
-				if [ -n "$proxy_host" ]; then
+				if [ -n "$proxy_origin" ]; then
+			echo "        proxy_set_header Origin            \"$proxy_origin\";";
+		fi
+		if [ -n "$proxy_origin" ]; then
+			echo "        proxy_set_header Origin            \"$proxy_origin\";";
+		fi
+		if [ -n "$proxy_host" ]; then
 			echo "        proxy_set_header Host              $proxy_host;";
 		else
 			echo "        proxy_set_header Host              \$http_host;";
@@ -736,6 +748,9 @@ render_service() { # render_service NAME
 		echo "    location / {"
 		echo "        proxy_pass $backend;"
 		echo "        proxy_http_version 1.1;"
+		if [ -n "$proxy_origin" ]; then
+			echo "        proxy_set_header Origin            \"$proxy_origin\";";
+		fi
 		if [ -n "$proxy_host" ]; then
 			echo "        proxy_set_header Host              $proxy_host;";
 		else
@@ -1141,6 +1156,7 @@ cmd_add() {
 	[ -n "$svc_zone" ] && uci set "v6edge.$sec.zone=$svc_zone"
 	uci set "v6edge.$sec.target=$target"
 	[ -n "$_phost" ] && uci set "v6edge.$sec.proxy_host=$_phost"
+	[ -n "$_porigin" ] && uci set "v6edge.$sec.proxy_origin=$_porigin"
 	uci set "v6edge.$sec.port=$port"
 	uci set "v6edge.$sec.scheme=$scheme"
 	uci set "v6edge.$sec.lan_only=$lan_only"
@@ -1271,7 +1287,7 @@ cmd_zone() {
 	add)
 		name=${1:-}; [ -n "$name" ] || die "用法: v6edge zone add <域名> --provider X [--token T | --ali-key AK --ali-secret SK]"
 		shift 2>/dev/null || true
-		prov=""; _tok=""; _ak=""; _sk=""; _phost=""
+		prov=""; _tok=""; _ak=""; _sk=""; _phost=""; _porigin=""
 		while [ $# -gt 0 ]; do
 			case "$1" in
 			--provider) prov=$2; shift 2 ;;
@@ -1280,6 +1296,7 @@ cmd_zone() {
 			--ali-secret) _sk=$2; shift 2 ;;
 			--cred) _cred=$2; shift 2 ;;
 			--proxy-host) _phost=$2; shift 2 ;;
+			--proxy-origin) _porigin=$2; shift 2 ;;
 			*) shift ;;
 			esac
 		done
@@ -1431,6 +1448,7 @@ cmd_set() {
 		--ws) uci set "v6edge.$sec.ws=$2"; shift 2 ;;
 		--deny-post) uci set "v6edge.$sec.deny_post=$2"; shift 2 ;;
 		--proxy-host) uci set "v6edge.$sec.proxy_host=$2"; shift 2 ;;
+		--proxy-origin) uci set "v6edge.$sec.proxy_origin=$2"; shift 2 ;;
 		--enabled) uci set "v6edge.$sec.enabled=$2"; shift 2 ;;
 		*) die "未知参数 $1" ;;
 		esac
