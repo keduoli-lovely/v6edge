@@ -77,41 +77,19 @@ v6edge provider test     # 校验凭据 + 域名是否可用
 
 ## 安装
 
-`node tools/build-bundle.js` 会产出三种产物：
+`node tools/build-bundle.js` 会产出以下产物（括号内为直接下载链接，取自最新 Release）：
 
 | 产物 | 适用 | 说明 |
 |---|---|---|
-| `v6edge-0.1.0-r1.apk` + `luci-app-v6edge-0.1.0-r1.apk` | **apk 系（iStoreOS 25.x / OpenWrt 25.x）** | ADB 格式，iStoreOS 离线安装页可直接装（页面用 `apk add --allow-untrusted`，未签名也接受）。本机构建：`sh tools/build-apk-on-device.sh /tmp/out` |
-| `v6edge_0.1.0-24_all.ipk` + `luci-app-v6edge_0.1.0-24_all.ipk` | **opkg 系（OpenWrt 24.10 / iStoreOS 24.x）** | `opkg install ...`。⚠️ apk 系统装 ipk 会报 `file format is invalid or inconsistent` |
-| `v6edge-0.1.0.run` | iStoreOS「离线安装」页 / 任意 shell | 自解压安装器，`sh v6edge-0.1.0.run [--fresh]` |
-| `v6edge-0.1.0-bundle.tar.gz` | 手动解压安装 | 解压后 `sh install.sh` |
+| [`v6edge-0.1.0-r1.apk`](https://github.com/keduoli-lovely/v6edge/releases/download/v0.1.0/v6edge-0.1.0-r1.apk) + [`luci-app-v6edge-0.1.0-r1.apk`](https://github.com/keduoli-lovely/v6edge/releases/download/v0.1.0/luci-app-v6edge-0.1.0-r1.apk) | **apk 系（iStoreOS 25.x / OpenWrt 25.x）** | ADB 格式，iStoreOS 离线安装页可直接装（页面用 `apk add --allow-untrusted`，未签名也接受）。本机构建：`sh tools/build-apk-on-device.sh /tmp/out` |
+| [`v6edge_0.1.0-24_all.ipk`](https://github.com/keduoli-lovely/v6edge/releases/download/v0.1.0/v6edge_0.1.0-24_all.ipk) + [`luci-app-v6edge_0.1.0-24_all.ipk`](https://github.com/keduoli-lovely/v6edge/releases/download/v0.1.0/luci-app-v6edge_0.1.0-24_all.ipk) | **opkg 系（OpenWrt 24.10 / iStoreOS 24.x）** | `opkg install ...`。⚠️ apk 系统装 ipk 会报 `file format is invalid or inconsistent` |
+| [`v6edge-0.1.0.run`](https://github.com/keduoli-lovely/v6edge/releases/download/v0.1.0/v6edge-0.1.0.run) | iStoreOS「离线安装」页 / 任意 shell | 自解压安装器，`sh v6edge-0.1.0.run [--fresh]` |
+| [`v6edge-0.1.0-bundle.tar.gz`](https://github.com/keduoli-lovely/v6edge/releases/download/v0.1.0/v6edge-0.1.0-bundle.tar.gz) | 手动解压安装 | 解压后 `sh install.sh` |
 
 > 两种包管理器只需装对应格式，安装后 `/etc/config/v6edge` 与 `/etc/v6edge/` 都不会被覆盖。
 
-三种安装方式都**幂等**：只有 `/etc/config/v6edge` 不存在时才写默认配置；
+所有安装方式都**幂等**：只有 `/etc/config/v6edge` 不存在时才写默认配置；
 `/etc/v6edge/` 下的 token、证书、acme、doctor 结果、nginx 生成文件、防火墙规则、cron 都不会被动。
-
-### 想测试「全新安装」怎么办
-
-```sh
-sh v6edge-0.1.0.run --fresh
-```
-
-`--fresh` 会把现有的 `/etc/config/v6edge` 和 `/etc/v6edge/` 改名成 `*.bak-<时间戳>`（可回滚），
-再按全新环境写入默认配置。测完要恢复：
-
-```sh
-mv /etc/config/v6edge.bak-<时间戳> /etc/config/v6edge
-mv /etc/v6edge.bak-<时间戳> /etc/v6edge
-```
-
-### 用 SDK 构建真正的 apk / ipk
-
-```sh
-git tag v0.1.0 && git push --tags      # 触发 .github/workflows/build.yml
-# 产物：v6edge_*.apk / luci-app-v6edge_*.apk（或 24.x 的 .ipk）
-apk add --allow-untrusted ./v6edge_*.apk ./luci-app-v6edge_*.apk
-```
 
 ## 快速开始
 
