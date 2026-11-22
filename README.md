@@ -77,14 +77,14 @@ v6edge provider test     # 校验凭据 + 域名是否可用
 
 ## 安装
 
-`node tools/build-bundle.js` 会产出以下产物（括号内为直接下载链接，取自最新 Release）：
+`node tools/build-bundle.js` 会产出以下产物（点击文件名直接下载，链接指向 latest Release，不用随版本更新）：
 
 | 产物 | 适用 | 说明 |
 |---|---|---|
-| [`v6edge-0.1.0-r1.apk`](https://github.com/keduoli-lovely/v6edge/releases/download/v0.1.0/v6edge-0.1.0-r1.apk) + [`luci-app-v6edge-0.1.0-r1.apk`](https://github.com/keduoli-lovely/v6edge/releases/download/v0.1.0/luci-app-v6edge-0.1.0-r1.apk) | **apk 系（iStoreOS 25.x / OpenWrt 25.x）** | ADB 格式，iStoreOS 离线安装页可直接装（页面用 `apk add --allow-untrusted`，未签名也接受）。本机构建：`sh tools/build-apk-on-device.sh /tmp/out` |
-| [`v6edge_0.1.0-24_all.ipk`](https://github.com/keduoli-lovely/v6edge/releases/download/v0.1.0/v6edge_0.1.0-24_all.ipk) + [`luci-app-v6edge_0.1.0-24_all.ipk`](https://github.com/keduoli-lovely/v6edge/releases/download/v0.1.0/luci-app-v6edge_0.1.0-24_all.ipk) | **opkg 系（OpenWrt 24.10 / iStoreOS 24.x）** | `opkg install ...`。⚠️ apk 系统装 ipk 会报 `file format is invalid or inconsistent` |
-| [`v6edge-0.1.0.run`](https://github.com/keduoli-lovely/v6edge/releases/download/v0.1.0/v6edge-0.1.0.run) | iStoreOS「离线安装」页 / 任意 shell | 自解压安装器，`sh v6edge-0.1.0.run [--fresh]` |
-| [`v6edge-0.1.0-bundle.tar.gz`](https://github.com/keduoli-lovely/v6edge/releases/download/v0.1.0/v6edge-0.1.0-bundle.tar.gz) | 手动解压安装 | 解压后 `sh install.sh` |
+| [`v6edge-0.1.0-r1.apk`](https://github.com/keduoli-lovely/v6edge/releases/latest/download/v6edge-0.1.0-r1.apk) + [`luci-app-v6edge-0.1.0-r1.apk`](https://github.com/keduoli-lovely/v6edge/releases/latest/download/luci-app-v6edge-0.1.0-r1.apk) | **apk 系（iStoreOS 25.x / OpenWrt 25.x）** | ADB 格式，iStoreOS 离线安装页可直接装（页面用 `apk add --allow-untrusted`，未签名也接受）。本机构建：`sh tools/build-apk-on-device.sh /tmp/out` |
+| [`v6edge_0.1.0-24_all.ipk`](https://github.com/keduoli-lovely/v6edge/releases/latest/download/v6edge_0.1.0-24_all.ipk) + [`luci-app-v6edge_0.1.0-24_all.ipk`](https://github.com/keduoli-lovely/v6edge/releases/latest/download/luci-app-v6edge_0.1.0-24_all.ipk) | **opkg 系（OpenWrt 24.10 / iStoreOS 24.x）** | `opkg install ...`。⚠️ apk 系统装 ipk 会报 `file format is invalid or inconsistent` |
+| [`v6edge-0.1.0.run`](https://github.com/keduoli-lovely/v6edge/releases/latest/download/v6edge-0.1.0.run) | iStoreOS「离线安装」页 / 任意 shell | 自解压安装器，`sh v6edge-0.1.0.run [--fresh]` |
+| [`v6edge-0.1.0-bundle.tar.gz`](https://github.com/keduoli-lovely/v6edge/releases/latest/download/v6edge-0.1.0-bundle.tar.gz) | 手动解压安装 | 解压后 `sh install.sh` |
 
 > 两种包管理器只需装对应格式，安装后 `/etc/config/v6edge` 与 `/etc/v6edge/` 都不会被覆盖。
 
