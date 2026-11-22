@@ -682,7 +682,7 @@ return view.extend({
 			}
 
 return E('div', { 'class': 'cf-page' }, [
-			E('h2', {}, 'Cloudflare 边缘管理'),
+			E('h2', {}, 'v6edge'),
 			E('p', { 'class': 'cbi-section-descr', 'style': 'padding-bottom:6px;margin-bottom:18px' },
 				'把局域网服务发布到公网 IPv6：自动维护 AAAA、签发证书、生成 nginx TLS 反代。' +
 				'注意：光猫的 IPv6 防火墙必须关闭/放行；80/443 常被运营商封，请用高位端口。'),
