@@ -1,6 +1,6 @@
 {
 	"admin/services/v6edge": {
-		"title": "Cloudflare 边缘",
+		"title": "Cloudflare 边缘管理",
 		"order": 61,
 		"action": {
 			"type": "view",
